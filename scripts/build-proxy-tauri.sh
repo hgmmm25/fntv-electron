@@ -21,6 +21,17 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 PROXY_SRC="$PROJECT_ROOT/src/modules/proxy"
 BINARIES_DIR="$PROJECT_ROOT/src-tauri/binaries"
 
+# ─── Go 工具链检查 ─────────────────────────────────────────────────
+if ! command -v go &>/dev/null; then
+  echo "⚠️  Go 未安装或不在 PATH 中，跳过 proxy 编译"
+  echo "   请安装 Go: https://go.dev/dl/"
+  echo "   当前使用 src-tauri/binaries/ 中的占位文件"
+  echo ""
+  echo "📦  src-tauri/binaries/ 目录内容:"
+  ls -lh "$BINARIES_DIR"
+  exit 0
+fi
+
 # Go 源码目录校验
 if [ ! -d "$PROXY_SRC" ]; then
   echo "❌  Go proxy 源码目录不存在: $PROXY_SRC"
