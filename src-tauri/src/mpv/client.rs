@@ -113,6 +113,11 @@ impl MpvIpcClient {
             .await
     }
 
+    /// 生成下一個唯一請求 ID（供外部呼叫以避免跨層級 ID 衝突）
+    pub fn next_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// 訂閱事件（property-change 等）
     pub fn subscribe_events(&self) -> broadcast::Receiver<IpcEvent> {
         self.event_tx.subscribe()

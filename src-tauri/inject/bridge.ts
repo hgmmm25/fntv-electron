@@ -319,6 +319,18 @@ export function setupElectronAPIShim(): void {
     ]);
 
     /**
+     * MPV 事件名稱映射：前端 channel 名 → Rust emit 事件名
+     *
+     * Rust 端透過 `app_handle.emit("mpv-progress", ...)` 發送事件，
+     * 前端透過 `electronAPI.on('progress', ...)` 接收。此映射連接兩端。
+     */
+    const EVENT_NAME_MAP: Record<string, string> = {
+        'progress': 'mpv-progress',
+        'exit': 'mpv-exit',
+        'error': 'mpv-error',
+    };
+
+    /**
      * Electron channel 名稱 → Tauri command 名稱映射
      * Electron 使用 kebab-case，Tauri 使用 snake_case
      */
@@ -386,8 +398,9 @@ export function setupElectronAPIShim(): void {
                 return () => {};
             }
 
-            // Tauri 事件名稱使用 tauri:// 前綴的 channel
-            const eventName = `app://internal/${channel}`;
+            // MPV 事件：透過 EVENT_NAME_MAP 映射到 Rust emit 名稱；
+            // 其他 channel 保持原有內部前綴行為。
+            const eventName = EVENT_NAME_MAP[channel] ?? `app://internal/${channel}`;
             let unlistenFn: (() => void) | null = null;
 
             window.__TAURI_INTERNALS__.listen(eventName, (event) => {
@@ -411,7 +424,7 @@ export function setupElectronAPIShim(): void {
                 return () => {};
             }
 
-            const eventName = `app://internal/${channel}`;
+            const eventName = EVENT_NAME_MAP[channel] ?? `app://internal/${channel}`;
             let unlistenFn: (() => void) | null = null;
 
             window.__TAURI_INTERNALS__.listen(eventName, (event) => {

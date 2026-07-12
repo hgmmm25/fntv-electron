@@ -91,7 +91,7 @@ function tryGetItemGuidFromOriginalLogic(button: HTMLElement): Promise<string | 
             // 拦截 XMLHttpRequest
             XMLHttpRequest.prototype.open = function (method: string, url: string | URL): void {
                 (this as unknown as Record<string, unknown>)._url = url;
-                return originalXHROpen.apply(this, arguments as unknown as [string, string | URL]);
+                return originalXHROpen.apply(this, arguments as unknown as [string, string, boolean]);
             };
 
             XMLHttpRequest.prototype.send = function (data?: Document | XMLHttpRequestBodyInit | null): void {
@@ -117,7 +117,7 @@ function tryGetItemGuidFromOriginalLogic(button: HTMLElement): Promise<string | 
                     }, 100);
                     return;
                 }
-                return originalXHRSend.apply(this, arguments as unknown as [Document | XMLHttpRequestBodyInit | null?]);
+                return originalXHRSend.apply(this, arguments as unknown as [Document | XMLHttpRequestBodyInit | null | undefined]);
             };
 
             button.setAttribute('data-allow-original-play', 'true');

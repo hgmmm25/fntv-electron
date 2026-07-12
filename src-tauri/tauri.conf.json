@@ -6,22 +6,11 @@
   "build": {
     "frontendDist": "../resource/login",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "node scripts/build-inject.mjs",
+    "beforeDevCommand": "node scripts/build-inject.mjs --watch",
     "beforeBuildCommand": "node scripts/build-inject.mjs"
   },
   "app": {
-    "windows": [
-      {
-        "title": "飞牛影视",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 800,
-        "minHeight": 600,
-        "resizable": true,
-        "fullscreen": false,
-        "decorations": true
-      }
-    ],
+    "windows": [],
     "withGlobalTauri": true,
     "security": {
       "csp": null
@@ -65,10 +54,7 @@
           "name": "proxy",
           "sidecar": true,
           "cmd": "proxy",
-          "args": true,
-          "scope": [
-            { "validator": "^(--lang|127\\.0\\.0\\.1:\\d+)$" }
-          ]
+          "args": true
         }
       ]
     }

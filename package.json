@@ -24,7 +24,8 @@
         "build:proxy:tauri:mac": "bash scripts/build-proxy-tauri.sh mac-universal",
         "build:proxy:tauri:linux": "bash scripts/build-proxy-tauri.sh linux-x64",
         "build:proxy:tauri:all": "bash scripts/build-proxy-tauri.sh all",
-        "build:inject": "node scripts/build-inject.mjs"
+        "build:inject": "node scripts/build-inject.mjs",
+        "watch:inject": "node scripts/build-inject.mjs --watch"
     },
     "author": "tracing",
     "devDependencies": {

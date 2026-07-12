@@ -25,6 +25,7 @@ pub struct MpvPlayerState {
 #[tauri::command]
 pub async fn mpv_launch(
     state: State<'_, MpvPlayerState>,
+    app: tauri::AppHandle,
     player_path: Option<String>,
     extra_args: Option<Vec<String>>,
     debug: Option<bool>,
@@ -37,7 +38,7 @@ pub async fn mpv_launch(
         ..Default::default()
     };
     *player = MpvPlayer::new(config);
-    player.launch().await
+    player.launch(app).await
 }
 
 /// 播放單個 URL

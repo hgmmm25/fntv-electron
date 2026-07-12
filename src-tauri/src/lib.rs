@@ -5,7 +5,7 @@
 //! 2. 啟動 Go proxy sidecar 並註冊守護程序（含防孤兒機制）
 //! 3. 註冊 MPV 播放器 commands
 //! 4. 註冊 Frontend Bridge commands（play_movie, get_play_button_config, log_message）
-//! 5. 在主視窗載入前注入初始化腳本（src-tauri/inject/preload.iife.js）
+//! 5. 透過 initialization_script API 注入初始化腳本（src-tauri/inject/preload.iife.js）
 //! 6. 處理所有退出路徑（正常退出、托盤退出、關閉按鈕、異常退出），
 //!    確保 Go sidecar 被徹底 kill，不留孤兒進程。
 //!
@@ -29,6 +29,14 @@ mod winctrl;
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
+
+/// 由 `build-inject.mjs` 打包的注入腳本（編譯時嵌入）
+///
+/// 使用 `include_str!` 而非 runtime 讀取，確保：
+/// 1. 生產環境不需要 CARGO_MANIFEST_DIR hack
+/// 2. Tauri dev 的文件監聽能偵測到 preload.iife.js 變更並觸發重編譯
+/// 3. 每次 cargo build 都會重新讀取最新的打包結果
+const INJECT_JS: &str = include_str!("../inject/preload.iife.js");
 
 /// Tauri 應用入口
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -77,38 +85,17 @@ pub fn run() {
                 log::error!("系統托盤建立失敗: {e}");
             }
 
-            // ── 注入初始化腳本 ────────────────────────────────
+            // ── 注入初始化腳本 + Cookie 恢復 ─────────────────
             //
-            // 讀取由 `scripts/build-inject.mjs` 打包的 IIFE JS，
-            // 透過 Tauri 的 initialization_script API 在頁面 DOMReady 前注入。
-            let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-                .unwrap_or_else(|_| ".".to_string());
-            let inject_path = std::path::Path::new(&manifest_dir)
-                .join("inject")
-                .join("preload.iife.js");
-
-            let inject_js = match std::fs::read_to_string(&inject_path) {
-                Ok(content) => {
-                    log::info!(
-                        "成功載入注入腳本: {} ({} bytes)",
-                        inject_path.display(),
-                        content.len()
-                    );
-                    content
-                }
-                Err(e) => {
-                    log::warn!(
-                        "無法讀取注入腳本 {}: {} (功能降級，無注入腳本)",
-                        inject_path.display(),
-                        e
-                    );
-                    String::new()
-                }
-            };
-
-            // ── 設定檔 Cookie 恢復 ──────────────────────────
+            // 將 Cookie 恢復腳本與注入腳本（由 include_str! 編譯時嵌入）
+            // 合併為單一初始化腳本，透過 initialization_script API 注入。
+            //
+            // initialization_script 的優勢：
+            // 1. 在頁面任何腳本之前執行（類似 HTML <head> 最前面的 <script>）
+            // 2. 每次頁面導航/重新整理都會自動重新執行
+            // 3. 無需手動呼叫 eval()，時序問題歸零
             let saved_config = config::read_config(&handle);
-            if let (Some(domain), Some(token)) =
+            let cookie_js = if let (Some(domain), Some(token)) =
                 (saved_config.domain.clone(), saved_config.token.clone())
             {
                 if !token.is_empty() && domain.starts_with("http") {
@@ -117,29 +104,57 @@ pub fn run() {
                     let secure = if is_https { "secure; " } else { "" };
                     let same_site = if is_https { "none" } else { "lax" };
                     let token_escaped = token.replace('\'', "\\'");
-                    let cookie_js = format!(
+                    format!(
                         "document.cookie='Trim-MC-token={token_escaped}; path=/; {secure}samesite={same_site}';\
                          document.cookie='mode=relay; path=/; {secure}samesite={same_site}';",
-                        token_escaped = token_escaped,
-                        secure = secure,
-                        same_site = same_site,
-                    );
-                    let combined = format!("{}\n{}", cookie_js, inject_js);
-
-                    if let Some(window) = handle.get_webview_window("main") {
-                        if let Err(e) = window.eval(&combined) {
-                            log::error!("注入 cookie 腳本失敗: {e}");
-                        } else {
-                            log::info!("Cookie 恢復腳本已注入");
-                        }
-                    }
+                    )
                 } else {
-                    self_eval_inject(&handle, &inject_js);
+                    String::new()
                 }
             } else {
                 log::info!("無已儲存的登入資訊，跳過 cookie 恢復");
-                self_eval_inject(&handle, &inject_js);
-            }
+                String::new()
+            };
+
+            let init_script = if cookie_js.is_empty() {
+                INJECT_JS.to_string()
+            } else {
+                format!("{cookie_js}\n{INJECT_JS}")
+            };
+
+            log::info!(
+                "注入腳本已準備 ({} bytes, 含{} cookie 恢復)",
+                init_script.len(),
+                if cookie_js.is_empty() { "無" } else { "" },
+            );
+
+            // ── 建立主視窗（程式化建立，非 tauri.conf.json）──────────
+            //
+            // 從 tauri.conf.json 的 build.dev_url / frontend_dist 決定 URL，
+            // 並透過 initialization_script 將注入腳本掛載到 webview。
+            //
+            // 不在 tauri.conf.json 定義 windows，而是程式化建立，是因為
+            // initialization_script() 必須在 builder 階段掛上——程式化建立
+            // 讓我們可以在 setup() 裡動態組裝「cookie 恢復 + 注入腳本」後再注入。
+            let app_config = app.config();
+            let url = app_config
+                .build
+                .dev_url
+                .clone()
+                .map(tauri::WebviewUrl::External)
+                .unwrap_or_else(|| tauri::WebviewUrl::App("index.html".into()));
+
+            let _window = tauri::WebviewWindowBuilder::new(app, "main", url)
+                .title("飞牛影视")
+                .inner_size(1200.0, 800.0)
+                .min_inner_size(800.0, 600.0)
+                .resizable(true)
+                .decorations(true)
+                .initialization_script(&init_script)
+                .build()
+                .expect("建立主視窗失敗");
+
+            log::info!("主視窗已建立（含 initialization_script）");
 
             Ok(())
         })
@@ -190,6 +205,7 @@ pub fn run() {
             config::set_exit_mode,
             config::get_mpv_player_path,
             config::set_mpv_player_path,
+            proxy_daemon::get_proxy_base_url,
             // 登入認證（對應 Electron auth plugin）
             auth::login,
             auth::restore_cookies,
@@ -242,20 +258,4 @@ pub fn run() {
             _ => {}
         }
     });
-}
-
-/// 輔助函數：將注入腳本 eval 到主視窗
-fn self_eval_inject(handle: &tauri::AppHandle, inject_js: &str) {
-    if inject_js.is_empty() {
-        return;
-    }
-    if let Some(window) = handle.get_webview_window("main") {
-        if let Err(e) = window.eval(inject_js) {
-            log::error!("注入初始化腳本失敗: {e}");
-        } else {
-            log::info!("初始化腳本已注入到主視窗");
-        }
-    } else {
-        log::warn!("找不到主視窗 (label='main')，跳過初始化腳本注入");
-    }
 }

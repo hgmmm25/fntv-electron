@@ -34,13 +34,24 @@
 //! `mpv_get_window_handle` 和 `mpv_sync_window_position` 兩個 command。
 
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tauri::Emitter;
 use tokio::process::{Child, Command};
+use tokio::sync::{broadcast, RwLock};
 
 use super::client::MpvIpcClient;
 use super::protocol::*;
+
+// ─── 常數 ───────────────────────────────────────────────────────────
+
+/// Tauri 事件名稱 — 必須與前端 `inject/bridge.ts` 的 EVENT_NAME_MAP 一致
+const EVENT_PROGRESS: &str = "mpv-progress";
+const EVENT_EXIT: &str = "mpv-exit";
+#[allow(dead_code)] // 保留：目前 MPV IPC 無 error 事件類型，錯誤透過 command 回傳
+const EVENT_ERROR: &str = "mpv-error";
+
+/// 進度事件（time-pos）節流間隔：避免高頻 emit 造成 IPC 通道過載
+const PROGRESS_THROTTLE: std::time::Duration = std::time::Duration::from_millis(500);
 
 // ─── 配置 ───────────────────────────────────────────────────────────
 
@@ -134,7 +145,7 @@ impl MpvPlayer {
     }
 
     /// 啟動 MPV 並連接 IPC
-    pub async fn launch(&mut self) -> Result<(), String> {
+    pub async fn launch(&mut self, app_handle: tauri::AppHandle) -> Result<(), String> {
         // 構建命令列參數
         let mut args = vec![
             "--idle".to_string(),
@@ -181,8 +192,11 @@ impl MpvPlayer {
         let client = MpvIpcClient::connect(&self.socket_path).await?;
         self.client = Some(client);
 
-        // 啟動事件監聽
-        self.start_event_listener().await;
+        // 訂閱 MPV 屬性（observe_property 必須在事件監聽前完成）
+        self.observe_properties().await?;
+
+        // 啟動事件監聽（含前端 emit 橋接）
+        self.start_event_listener(app_handle).await;
 
         log::info!("MPV 啟動成功，IPC 已連接");
         Ok(())
@@ -211,8 +225,36 @@ impl MpvPlayer {
         }
     }
 
-    /// 啟動事件監聽（背景任務）
-    async fn start_event_listener(&self) {
+    /// 訂閱 MPV 屬性（property-change 事件的前提條件）
+    ///
+    /// MPV IPC 協議要求先透過 `observe_property` 訂閱，才會主動推送
+    /// 該屬性的變更事件。未訂閱的屬性不會觸發 property-change。
+    async fn observe_properties(&self) -> Result<(), String> {
+        let client = self.client.as_ref().ok_or("MPV 未啟動")?;
+        let props: &[(u64, &str)] = &[
+            (1, "time-pos"),
+            (2, "pause"),
+            (3, "volume"),
+            (4, "mute"),
+            (5, "duration"),
+            (6, "playlist-pos"),
+            (7, "playlist-count"),
+            (8, "path"),
+        ];
+        for &(id, name) in props {
+            client
+                .send_command(IpcRequest::observe_property(id, name, client.next_id()))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// 啟動事件監聽（背景任務，含 Tauri emit 橋接）
+    ///
+    /// 收到 property-change 事件後更新共享狀態，並透過 `AppHandle::emit()`
+    /// 將進度/退出事件推送到前端。進度事件（time-pos）帶有 500ms 節流，
+    /// 避免高頻 IPC 通道過載導致介面卡頓。
+    async fn start_event_listener(&self, app_handle: tauri::AppHandle) {
         let client = match self.client.as_ref() {
             Some(c) => c,
             None => return,
@@ -222,7 +264,12 @@ impl MpvPlayer {
         let state = self.state.clone();
         let event_tx = self.event_tx.clone();
 
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
+            // 記錄上次 emit 進度的時間，初始值設為「已過期」確保首次立即發送
+            let mut last_progress_emit = std::time::Instant::now()
+                .checked_sub(PROGRESS_THROTTLE)
+                .unwrap_or_else(std::time::Instant::now);
+
             while let Ok(evt) = rx.recv().await {
                 match evt.event.as_str() {
                     "property-change" => {
@@ -230,15 +277,23 @@ impl MpvPlayer {
                             let mut state = state.write().await;
                             update_property(&mut state, name, data);
 
-                            // 進度事件
+                            // 進度事件：time-pos
                             if name == "time-pos" {
                                 if let Some(ts) = data.as_f64() {
-                                    let _ = event_tx.send(PlayerEvent::Progress {
+                                    let progress = PlayerEvent::Progress {
                                         item_guid: state.item_guid.clone(),
                                         ts,
                                         duration: state.duration,
                                         percentage: state.percentage,
-                                    });
+                                    };
+                                    drop(state);
+
+                                    // 節流：進度事件最多每 500ms 發送一次
+                                    if last_progress_emit.elapsed() >= PROGRESS_THROTTLE {
+                                        let _ = event_tx.send(progress.clone());
+                                        let _ = app_handle.emit(EVENT_PROGRESS, &progress);
+                                        last_progress_emit = std::time::Instant::now();
+                                    }
                                 }
                             }
                         }
@@ -247,12 +302,16 @@ impl MpvPlayer {
                         let reason = evt.reason.as_deref().unwrap_or("unknown");
                         log::info!("MPV end-file: {reason}");
                         if reason == "quit" {
-                            let _ = event_tx.send(PlayerEvent::Exit { code: 0 });
+                            let exit = PlayerEvent::Exit { code: 0 };
+                            let _ = event_tx.send(exit.clone());
+                            let _ = app_handle.emit(EVENT_EXIT, &exit);
                         }
                     }
                     _ => {}
                 }
             }
+
+            log::info!("MPV 事件監聽迴圈結束");
         });
     }
 
@@ -262,11 +321,10 @@ impl MpvPlayer {
     pub async fn play(&self, url: &str) -> Result<(), String> {
         let client = self.client.as_ref().ok_or("MPV 未啟動")?;
         client
-            .send_command(IpcRequest::loadfile(url, "replace", next_id()))
+            .send_command(IpcRequest::loadfile(url, "replace", client.next_id()))
             .await?;
-        let mut state = self.state.write().await;
-        state.is_playing = true;
-        state.current_path = url.to_string();
+        self.state.write().await.is_playing = true;
+        self.state.write().await.current_path = url.to_string();
         Ok(())
     }
 
@@ -280,7 +338,7 @@ impl MpvPlayer {
 
         // 生成 M3U8 檔案
         let content = generate_m3u8(&items);
-        let path = std::env::temp_dir().join(format!("fntv_playlist_{}.m3u8", next_id()));
+        let path = std::env::temp_dir().join(format!("fntv_playlist_{}.m3u8", client.next_id()));
         tokio::fs::write(&path, &content)
             .await
             .map_err(|e| format!("寫入播放列表失敗: {e}"))?;
@@ -290,7 +348,7 @@ impl MpvPlayer {
             .send_command(IpcRequest::loadlist(
                 path.to_str().unwrap_or(""),
                 "replace",
-                next_id(),
+                client.next_id(),
             ))
             .await?;
 
@@ -309,7 +367,7 @@ impl MpvPlayer {
                 .send_command(IpcRequest::set_property(
                     "force-media-title",
                     serde_json::Value::String(title),
-                    next_id(),
+                    client.next_id(),
                 ))
                 .await;
 
@@ -337,7 +395,7 @@ impl MpvPlayer {
             .send_command(IpcRequest::set_property(
                 "pause",
                 serde_json::Value::Bool(true),
-                next_id(),
+                client.next_id(),
             ))
             .await?;
         self.state.write().await.pause = true;
@@ -351,7 +409,7 @@ impl MpvPlayer {
             .send_command(IpcRequest::set_property(
                 "pause",
                 serde_json::Value::Bool(false),
-                next_id(),
+                client.next_id(),
             ))
             .await?;
         self.state.write().await.pause = false;
@@ -362,7 +420,7 @@ impl MpvPlayer {
     pub async fn stop(&self) -> Result<(), String> {
         let client = self.client.as_ref().ok_or("MPV 未啟動")?;
         client
-            .send_command(IpcRequest::stop(next_id()))
+            .send_command(IpcRequest::stop(client.next_id()))
             .await?;
         self.state.write().await.is_playing = false;
         Ok(())
@@ -372,7 +430,7 @@ impl MpvPlayer {
     pub async fn seek(&self, seconds: f64) -> Result<(), String> {
         let client = self.client.as_ref().ok_or("MPV 未啟動")?;
         client
-            .send_command(IpcRequest::seek(seconds, next_id()))
+            .send_command(IpcRequest::seek(seconds, client.next_id()))
             .await?;
         Ok(())
     }
@@ -384,7 +442,7 @@ impl MpvPlayer {
             .send_command(IpcRequest::set_property(
                 "volume",
                 serde_json::json!(volume),
-                next_id(),
+                client.next_id(),
             ))
             .await?;
         self.state.write().await.volume = volume;
@@ -398,7 +456,7 @@ impl MpvPlayer {
             .send_command(IpcRequest::set_property(
                 "mute",
                 serde_json::Value::Bool(mute),
-                next_id(),
+                client.next_id(),
             ))
             .await?;
         self.state.write().await.is_muted = mute;
@@ -409,7 +467,7 @@ impl MpvPlayer {
     pub async fn get_property(&self, name: &str) -> Result<serde_json::Value, String> {
         let client = self.client.as_ref().ok_or("MPV 未啟動")?;
         client
-            .send_command(IpcRequest::get_property(name, next_id()))
+            .send_command(IpcRequest::get_property(name, client.next_id()))
             .await
     }
 
@@ -421,7 +479,7 @@ impl MpvPlayer {
     ) -> Result<(), String> {
         let client = self.client.as_ref().ok_or("MPV 未啟動")?;
         client
-            .send_command(IpcRequest::set_property(name, value, next_id()))
+            .send_command(IpcRequest::set_property(name, value, client.next_id()))
             .await?;
         Ok(())
     }
@@ -478,7 +536,7 @@ impl MpvPlayer {
 
         for attempt in 0..10 {
             match client
-                .send_command(IpcRequest::seek(position, next_id()))
+                .send_command(IpcRequest::seek(position, client.next_id()))
                 .await
             {
                 Ok(_) => {
@@ -500,13 +558,6 @@ impl MpvPlayer {
 }
 
 // ─── 輔助函數 ──────────────────────────────────────────────────────
-
-/// 全域請求 ID 計數器（僅用於播放器層級的便利呼叫）
-fn next_id() -> u64 {
-    use std::sync::atomic::AtomicU64;
-    static COUNTER: AtomicU64 = AtomicU64::new(10000); // 從 10000 開始，避免與 client 內部 ID 衝突
-    COUNTER.fetch_add(1, Ordering::Relaxed)
-}
 
 /// 平台對應的 socket 路徑
 fn platform_socket_path() -> String {
