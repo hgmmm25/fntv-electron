@@ -138,13 +138,10 @@ pub fn run() {
             // 不在 tauri.conf.json 定義 windows，而是程式化建立，是因為
             // initialization_script() 必須在 builder 階段掛上——程式化建立
             // 讓我們可以在 setup() 裡動態組裝「cookie 恢復 + 注入腳本」後再注入。
-            let app_config = app.config();
-            let url = app_config
-                .build
-                .dev_url
-                .clone()
-                .map(tauri::WebviewUrl::External)
-                .unwrap_or_else(|| tauri::WebviewUrl::App("index.html".into()));
+            // WebviewUrl::App 會根據環境自動路由：
+            // - dev 模式：Tauri 自動導向 dev_url（localhost:3000）
+            // - build 模式：從 frontend_dist（resource/login）載入靜態資源
+            let url = tauri::WebviewUrl::App("index.html".into());
 
             let _window = tauri::WebviewWindowBuilder::new(app, "main", url)
                 .title("飞牛影视")
