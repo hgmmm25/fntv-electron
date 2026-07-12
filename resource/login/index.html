@@ -991,7 +991,8 @@
 
     <script>
         // ── Tauri / Electron 兼容層 ──────────────────────────
-        const isTauri = typeof window.__TAURI_INTERNALS__ !== 'undefined' && typeof window.__TAURI_INTERNALS__.invoke === 'function';
+        const isTauri = typeof window !== 'undefined'
+            && typeof window.__TAURI__?.core?.invoke === 'function';
         let ipcRenderer = null;
         if (!isTauri) {
             // Electron 環境：require('electron') 可用
@@ -1002,7 +1003,7 @@
          * Tauri invoke 封裝（替代 ipcRenderer.send + ipcRenderer.on 的事件模式）
          */
         async function tauriInvoke(command, payload) {
-            return window.__TAURI_INTERNALS__.invoke(command, payload !== undefined ? { payload } : {});
+            return window.__TAURI__.core.invoke(command, payload !== undefined ? { payload } : {});
         }
 
         /**
@@ -1557,49 +1558,6 @@
             ipcSend('get-config');
         }
 
-        // 监听配置数据返回
-        ipcRenderer.on('config-data', (event, data) => {
-            const { config, history } = data;
-            historyData = history || [];
-            
-            // 如果有当前配置，填充到表单中
-            if (config && config.domain) {
-                // 去除掉http://和https://
-                domainInput.value = config.domain.replace(/^https?:\/\//, '');
-                // 根据保存的useHttps设置复选框状态
-                if (config.useHttps) {
-                    document.getElementById('httpsSwitch').checked = config.useHttps;
-                }
-            }
-            if (config && config.account) {
-                usernameInput.value = config.account;
-            }
-            
-            // 渲染历史记录
-            renderHistoryList();
-            
-            // 检查输入状态
-            checkInputs();
-        });
-
-        // 监听历史记录删除成功
-        ipcRenderer.on('history-item-deleted', (event, data) => {
-            // 重新加载配置数据
-            loadConfigData();
-        });
-
-        // 监听登录错误消息
-        ipcRenderer.on('login-error', (event, data) => {
-            const { title, message } = data;
-            showCustomMessage('error', title, message);
-        });
-
-        // 监听登录成功消息
-        ipcRenderer.on('login-success', (event, data) => {
-            const { title, message } = data;
-            showCustomMessage('success', title, message);
-        });
-
         // 添加额外的焦点管理事件监听器
         document.addEventListener('click', function(e) {
             // 如果点击的不是历史记录相关元素，确保输入框可以正常获取焦点
@@ -1686,13 +1644,6 @@
         // 更新按钮点击事件
         updateBtn.addEventListener('click', handleUpdateCheck);
 
-        // 监听版本信息
-        ipcRenderer.on('version-info', (event, data) => {
-            if (data && data.version) {
-                versionText.textContent = `版本 ${data.version}`;
-            }
-        });
-
         // 代理设置相关函数
         function initProxySettings() {
             // 获取当前代理设置
@@ -1747,37 +1698,6 @@
         document.addEventListener('click', (e) => {
             if (!proxyPanel.contains(e.target) && !proxySettingsBtn.contains(e.target)) {
                 closeProxyPanel();
-            }
-        });
-
-        // 监听代理设置响应
-        ipcRenderer.on('download-proxy-info', (event, data) => {
-            if (data) {
-                proxyEnabledSwitch.checked = data.enabled !== false; // 默认开启
-                proxyUrlInput.value = data.proxyUrl || 'https://ghfast.top';
-            }
-        });
-
-        // 监听播放按钮配置响应
-        ipcRenderer.on('play-button-config-info', (event, data) => {
-            if (data) {
-                hideOriginalPlayButtonSwitch.checked = data.hideOriginalPlayButton !== false; // 默认隐藏
-            }
-        });
-
-        ipcRenderer.on('download-proxy-set', (event, data) => {
-            if (data && data.success) {
-                window.log.info('代理设置保存成功');
-            } else {
-                window.log.error('代理设置保存失败:', data.error);
-            }
-        });
-
-        ipcRenderer.on('play-button-config-set', (event, data) => {
-            if (data && data.success) {
-                window.log.info('播放按钮配置保存成功');
-            } else {
-                window.log.error('播放按钮配置保存失败:', data.error);
             }
         });
 

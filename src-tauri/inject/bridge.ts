@@ -1,11 +1,11 @@
 // src-tauri/inject/bridge.ts
 // Tauri 腳本注入橋接器
 //
-// 在被注入的遠端網頁環境中，透過 window.__TAURI_INTERNALS__.invoke() 與
+// 在被注入的遠端網頁環境中，透過 window.__TAURI__.core.invoke() 與
 // Rust 後端安全地通訊，取代 Electron 的 ipcRenderer.send / ipcRenderer.invoke。
 //
 // 安全性：
-// 1. 所有 invoke 都走 __TAURI_INTERNALS__，Tauri 核心會驗證 capabilities
+// 1. 所有 invoke 都走 __TAURI__.core（官方公開 API），Tauri 核心會驗證 capabilities
 // 2. 載荷包成 { payload } 單一參數，避免 command 引數展開問題
 // 3. invoke 失敗時 reject，呼叫端可自行處理（不吞錯）
 //
@@ -20,12 +20,24 @@
 //
 // 注意：Tauri 的事件系統（emit/listen）與 Electron 的 IPC 通道不同，
 // on/once 僅適用於 Rust 端透過 `app.emit()` 發送的事件。
+//
+// ## 關於 __TAURI__ 與 __TAURI_INTERNALS__
+//
+// 本模組使用 `window.__TAURI__.core.invoke()`（官方公開 API），而非
+// `window.__TAURI_INTERNALS__.invoke()`（內部 API）。原因：
+// 1. __TAURI__ 是官方穩定的公開介面，版本相容性有保障
+// 2. __TAURI_INTERNALS__ 是內部實現細節，可能在未來版本中變更或移除
+// 3. withGlobalTauri: true 確保 __TAURI__ 在初始化腳本執行時已就緒
 
 declare global {
     interface Window {
-        __TAURI_INTERNALS__?: {
-            invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
-            listen?: (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
+        __TAURI__?: {
+            core?: {
+                invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+            };
+            event?: {
+                listen: (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
+            };
         };
         electronAPI?: {
             send: (channel: string, ...args: unknown[]) => void;
@@ -36,9 +48,10 @@ declare global {
     }
 }
 
-/** 檢查 Tauri 內部 API 是否可用 */
+/** 檢查 Tauri 官方 API 是否可用 */
 export function isTauri(): boolean {
-    return typeof window !== 'undefined' && typeof window.__TAURI_INTERNALS__?.invoke === 'function';
+    return typeof window !== 'undefined'
+        && typeof window.__TAURI__?.core?.invoke === 'function';
 }
 
 /**
@@ -54,7 +67,7 @@ export async function send(command: string, data?: unknown): Promise<void> {
     }
     try {
         const args = data !== undefined ? { payload: data } : {};
-        await window.__TAURI_INTERNALS__!.invoke(command, args);
+        await window.__TAURI__!.core!.invoke(command, args);
     } catch (e) {
         console.error(`[bridge] send("${command}") 失敗:`, e);
     }
@@ -74,7 +87,7 @@ export async function invoke<T = unknown>(
     if (!isTauri()) {
         throw new Error(`Tauri 不可用，無法 invoke "${command}"`);
     }
-    return window.__TAURI_INTERNALS__!.invoke(command, args ?? {}) as Promise<T>;
+    return window.__TAURI__!.core!.invoke(command, args ?? {}) as Promise<T>;
 }
 
 // ─── 通道抽象 ─────────────────────────────────────────────────────
@@ -393,7 +406,7 @@ export function setupElectronAPIShim(): void {
          * 使用 Tauri 的 listen API（如果可用）
          */
         on(channel: string, callback: (...args: unknown[]) => void): () => void {
-            if (!window.__TAURI_INTERNALS__?.listen) {
+            if (!window.__TAURI__?.event?.listen) {
                 console.warn('[electronAPI] Tauri listen API 不可用');
                 return () => {};
             }
@@ -403,7 +416,7 @@ export function setupElectronAPIShim(): void {
             const eventName = EVENT_NAME_MAP[channel] ?? `app://internal/${channel}`;
             let unlistenFn: (() => void) | null = null;
 
-            window.__TAURI_INTERNALS__.listen(eventName, (event) => {
+            window.__TAURI__!.event!.listen(eventName, (event) => {
                 callback(event.payload);
             }).then((unlisten) => {
                 unlistenFn = unlisten;
@@ -420,14 +433,14 @@ export function setupElectronAPIShim(): void {
          * 一次性事件監聽（對應 ipcRenderer.once）
          */
         once(channel: string, callback: (...args: unknown[]) => void): () => void {
-            if (!window.__TAURI_INTERNALS__?.listen) {
+            if (!window.__TAURI__?.event?.listen) {
                 return () => {};
             }
 
             const eventName = EVENT_NAME_MAP[channel] ?? `app://internal/${channel}`;
             let unlistenFn: (() => void) | null = null;
 
-            window.__TAURI_INTERNALS__.listen(eventName, (event) => {
+            window.__TAURI__!.event!.listen(eventName, (event) => {
                 callback(event.payload);
                 unlistenFn?.();
             }).then((unlisten) => {
@@ -448,14 +461,14 @@ export function setupElectronAPIShim(): void {
     function sendToRust(command: string, data?: unknown): void {
         if (!isTauri()) return;
         const args = data !== undefined ? { payload: data } : {};
-        window.__TAURI_INTERNALS__!.invoke(command, args).catch((e) => {
+        window.__TAURI__!.core!.invoke(command, args).catch((e) => {
             console.error(`[electronAPI] send("${command}") 失敗:`, e);
         });
     }
 
     function invokeFromRust(command: string, args?: Record<string, unknown>): Promise<unknown> {
         if (!isTauri()) return Promise.reject(new Error('Tauri 不可用'));
-        return window.__TAURI_INTERNALS__!.invoke(command, args ?? {});
+        return window.__TAURI__!.core!.invoke(command, args ?? {});
     }
 }
 

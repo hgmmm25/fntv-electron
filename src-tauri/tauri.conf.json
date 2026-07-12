@@ -6,8 +6,8 @@
   "build": {
     "frontendDist": "../resource/login",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "node scripts/build-inject.mjs --watch",
-    "beforeBuildCommand": "node scripts/build-inject.mjs"
+    "beforeDevCommand": "npm run build:inject && npm run build:proxy:tauri:win",
+    "beforeBuildCommand": "npm run build:inject && npm run build:proxy:tauri:win"
   },
   "app": {
     "windows": [],

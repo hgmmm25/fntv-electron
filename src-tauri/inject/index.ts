@@ -12,12 +12,12 @@
 //
 // ## 關於 @tauri-apps/api 與 withGlobalTauri
 //
-// 本注入腳本**不依賴** `@tauri-apps/api` 套件——直接使用瀏覽器原生的
-// `window.__TAURI_INTERNALS__.invoke()`（由 Tauri webview 注入）。
-// 因此不需要在 tauri.conf.json 中啟用 `app.withGlobalTauri: true`，
-// 也不需要將 @tauri-apps/api bundle 進打包後的程式碼。
-// （tauri.conf.json 中的 `withGlobalTauri: true` 會把 @tauri-apps/api
-//  掛到 window.__TAURI__，但本腳本走更低層的 __TAURI_INTERNALS__，更穩定。）
+// 本注入腳本使用 `window.__TAURI__.core.invoke()`（由 withGlobalTauri: true 注入的
+// 官方公開 API），而非更低階的 `window.__TAURI_INTERNALS__.invoke()`。
+// withGlobalTauri: true 會將 @tauri-apps/api 掛載到 window.__TAURI__，提供：
+// - window.__TAURI__.core.invoke()     — IPC 呼叫
+// - window.__TAURI__.event.listen()    — 事件監聽
+// 這些是官方穩定的公開介面，版本相容性有保障。
 
 // ─── 載入核心模組 ──────────────────────────────────────────────────
 import { HookType, runHooks } from './hooks';
