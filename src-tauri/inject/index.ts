@@ -20,7 +20,7 @@
 // 這些是官方穩定的公開介面，版本相容性有保障。
 
 // ─── 載入核心模組 ──────────────────────────────────────────────────
-import { HookType, runHooks } from './hooks';
+import { HookType, registerHook, runHooks } from './hooks';
 import { setupElectronAPIShim } from './bridge';
 import logger from './logger';
 
@@ -30,6 +30,7 @@ import logger from './logger';
 import './plugins/playButton';
 import './plugins/playMaskButton';
 import './plugins/titlebar';
+import './plugins/scrollFix';
 
 // 暴露 logger 到 window（與 Electron 版本行為一致）
 declare global {
@@ -49,9 +50,34 @@ setupElectronAPIShim();
 
 // ─── DOM 初始化 hook 觸發 ──────────────────────────────────────────
 
+// ─── 隱藏詳情頁播放按鈕 ─────────────────────────────────────────────
+// 詳情頁的播放按鈕（semi-button-primary + !min-w-[150px]）不起作用，
+// 透過注入 CSS 將其隱藏。
+function hideDetailPlayButton(): void {
+    const style = document.createElement('style');
+    style.id = 'fn-hide-detail-play-btn';
+    style.textContent = `
+        button.semi-button.semi-button-primary[class*="!min-w-[150px]"] {
+            display: none !important;
+        }
+        /* 隐藏顶部功能栏 */
+        div.box-border.flex.w-full.px-4.flex-col {
+            display: none !important;
+        }
+        /* 隐藏半透明分割线 */
+        div.semi-divider.semi-divider-horizontal {
+            display: none !important;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
 function initInjector(): void {
     window.log = logger;
     window.logger = logger;
+
+    // 註冊隱藏詳情頁播放按鈕
+    registerHook(HookType.OnReady, hideDetailPlayButton);
 
     if (document.readyState !== 'loading') {
         runHooks(HookType.OnReady);

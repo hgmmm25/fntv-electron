@@ -1,222 +1,17 @@
 //! 登入認證模組 — FN API 通訊、登入流程、Cookie 恢復
 //!
-//! 完整移植自 `src/modules/fn_api/request.ts` 的簽名邏輯，
-//! 以及 `src/main/handlers/plugins/auth.ts` 的登入流程。
+//! 使用 `crate::fn_api` 共用模組進行 FN API 簽名與請求，
+//! 僅保留登入相關的業務邏輯。
 //!
 //! 職責：
-//! 1. FN API 簽名（Authx header）
-//! 2. 登入 API 呼叫（reqwest）
-//! 3. 登入後儲存設定 + 歷史記錄
-//! 4. Cookie 恢復（透過 webview eval 設定 Trim-MC-token）
+//! 1. 登入 API 呼叫
+//! 2. 登入後儲存設定 + 歷史記錄
+//! 3. Cookie 恢復（透過 webview eval 設定 Trim-MC-token）
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::Manager;
 
 use crate::config;
-
-// ─── FN API 常數 ──────────────────────────────────────────
-
-/// FN API 簽名金鑰
-const API_KEY: &str = "NDzZTVxnRKP8Z0jXg1VAMonaG8akvh";
-/// FN API 簽名密鑰
-const API_SECRET: &str = "16CCEB3D-AB42-077D-36A1-F355324E4237";
-
-// ─── FN API 簽名工具 ──────────────────────────────────────
-
-/// MD5 雜湊（hex 輸出）
-fn md5_hex(input: &str) -> String {
-    use md5::{Digest, Md5};
-    let mut hasher = Md5::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// 產生隨機數字字串（與 Electron 的 generateRandomDigits 相容）
-fn random_digits(start: u64, end: u64) -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    ((nanos % (end - start)) + start).to_string()
-}
-
-/// 產生 Authx header（對應 Electron 的 genFnAuthx）
-fn gen_fn_authx(url: &str, data: Option<&serde_json::Value>) -> String {
-    let nonce = random_digits(100_000, 1_000_000);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .to_string();
-
-    let data_json = data
-        .map(|d| serde_json::to_string(d).unwrap_or_default())
-        .unwrap_or_default();
-    let data_json_md5 = md5_hex(&data_json);
-
-    let sign_str = format!(
-        "{}_{}_{}_{}_{}_{}",
-        API_KEY, url, nonce, timestamp, data_json_md5, API_SECRET
-    );
-    let sign = md5_hex(&sign_str);
-
-    format!("nonce={}&timestamp={}&sign={}", nonce, timestamp, sign)
-}
-
-// ─── FN API 通用請求 ──────────────────────────────────────
-
-/// FN API 回應的外層結構（對應 FnApiResponseData）
-#[derive(Debug, Clone, serde::Deserialize)]
-struct FnApiResponse {
-    code: i64,
-    msg: String,
-    data: Option<serde_json::Value>,
-}
-
-/// 通用 FN API 請求（簡化版，僅保留登入所需的功能）
-///
-/// 對應 `src/modules/fn_api/request.ts` 的 `request()` 函數。
-async fn fn_request(
-    base_url: &str,
-    path: &str,
-    token: &str,
-    data: Option<serde_json::Value>,
-) -> Result<FnApiResponse, String> {
-    let full_url = format!("{}{}", base_url, path);
-
-    // POST 請求自動加入 nonce
-    let mut request_data = data.clone();
-    if let Some(ref mut d) = request_data {
-        d.as_object_mut()
-            .unwrap()
-            .insert("nonce".into(), serde_json::Value::String(random_digits(100_000, 1_000_000)));
-    }
-
-    let authx = gen_fn_authx(path, request_data.as_ref());
-
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true) // 與 Electron 版本一致：信任自簽憑證
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("建立 HTTP client 失敗: {e}"))?;
-
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "Content-Type",
-        "application/json"
-            .parse()
-            .map_err(|_| "Invalid Content-Type header".to_string())?,
-    );
-    headers.insert(
-        "Authorization",
-        token
-            .parse()
-            .map_err(|_| "Invalid Authorization header".to_string())?,
-    );
-    headers.insert(
-        "Cookie",
-        "mode=relay"
-            .parse()
-            .map_err(|_| "Invalid Cookie header".to_string())?,
-    );
-    headers.insert(
-        "Authx",
-        authx
-            .parse()
-            .map_err(|_| "Invalid Authx header".to_string())?,
-    );
-
-    // 最多重試 5 次（處理簽名錯誤）
-    let max_retries = 5;
-    for attempt in 0..=max_retries {
-        let resp = client
-            .post(&full_url)
-            .headers(headers.clone())
-            .json(&request_data)
-            .send()
-            .await
-            .map_err(|e| format!("FN API 請求失敗: {e}"))?;
-
-        // 處理重定向
-        if resp.status().is_redirection() {
-            let location = resp
-                .headers()
-                .get("location")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            if !location.is_empty() {
-                log::warn!("FN API 檢測到重定向 -> {location}");
-                // 解析新的 base URL
-                if location.starts_with("http") {
-                    if let Some(slash_pos) = location[8..].find('/') {
-                        let new_base = &location[..8 + slash_pos];
-                        let new_path = &location[8 + slash_pos..];
-                        return Box::pin(fn_request(
-                            new_base,
-                            new_path,
-                            token,
-                            request_data.clone(),
-                        ))
-                        .await;
-                    } else {
-                        return Box::pin(fn_request(
-                            &location,
-                            path,
-                            token,
-                            request_data.clone(),
-                        ))
-                        .await;
-                    }
-                }
-            }
-        }
-
-        // 非 JSON 回應（如二進制檔案）
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        if !content_type.contains("application/json") {
-            return Ok(FnApiResponse {
-                code: 0,
-                msg: "ok".to_string(),
-                data: None,
-            });
-        }
-
-        let status = resp.status();
-        let body: FnApiResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("FN API 回應解析失敗: {e} (HTTP {status})"))?;
-
-        // 簽名錯誤重試
-        if body.code == 5000 && body.msg == "invalid sign" {
-            if attempt >= max_retries {
-                return Err(format!("FN API 簽名錯誤，重試次數已用盡"));
-            }
-            log::warn!(
-                "FN API 簽名錯誤，重試中 attempt = {}",
-                attempt + 1
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            continue;
-        }
-
-        // 業務錯誤
-        if body.code != 0 {
-            return Err(body.msg);
-        }
-
-        return Ok(body);
-    }
-
-    Err("FN API 請求失敗：超出重試次數".to_string())
-}
+use crate::fn_api::{fn_request, HttpMethod};
 
 // ─── Login Result ─────────────────────────────────────────
 
@@ -264,7 +59,7 @@ pub async fn login(
         "password": password,
     });
 
-    let response = fn_request(&server, "/v/api/v1/login", "", Some(login_data)).await;
+    let response = fn_request(&server, "/v/api/v1/login", HttpMethod::Post, "", Some(login_data)).await;
 
     match response {
         Ok(res) => {

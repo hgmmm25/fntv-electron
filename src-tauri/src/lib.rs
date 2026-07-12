@@ -21,6 +21,7 @@
 mod auth;
 mod bridge;
 mod config;
+mod fn_api;
 mod mpv;
 mod proxy_daemon;
 mod tray;

@@ -6,7 +6,7 @@
 //! - 16 個 Tauri commands 供前端呼叫
 //! - 設定檔儲存於 `{app_data_dir}/config.json`（對應 Electron 的 `~/.fntv/config.json`）
 
-use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
+use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use serde::{Deserialize, Serialize};
 use tauri::Manager;
 
@@ -84,7 +84,7 @@ pub fn encrypt_password(plain: &str) -> String {
     buf[..plaintext.len()].copy_from_slice(plaintext);
 
     let encrypted = Aes256CbcEnc::new(ENCRYPTION_KEY.into(), &IV.into())
-        .encrypt_padded_mut::<NoPadding>(&mut buf, plaintext.len())
+        .encrypt_padded_mut::<Pkcs7>(&mut buf, plaintext.len())
         .expect("AES encryption should not fail");
     hex::encode(encrypted)
 }
@@ -98,7 +98,7 @@ pub fn decrypt_password(encrypted_hex: &str) -> String {
 
     let mut buf = ciphertext.clone();
     match Aes256CbcDec::new(ENCRYPTION_KEY.into(), &IV.into())
-        .decrypt_padded_mut::<NoPadding>(&mut buf)
+        .decrypt_padded_mut::<Pkcs7>(&mut buf)
     {
         Ok(plaintext) => String::from_utf8_lossy(plaintext).to_string(),
         Err(_) => String::new(),

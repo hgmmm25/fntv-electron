@@ -54,6 +54,15 @@ export function isTauri(): boolean {
         && typeof window.__TAURI__?.core?.invoke === 'function';
 }
 
+// ─── invoke 可用性快取 ──────────────────────────────────────
+// 當 invoke 因 ACL 被拒時，記住該 command 並不再重試，
+// 避免播放影片時產生數千次無效 IPC 請求導致卡頓。
+const blockedCommands = new Set<string>();
+
+function isBlocked(command: string): boolean {
+    return blockedCommands.has(command);
+}
+
 /**
  * fire-and-forget（替代 ipcRenderer.send）
  *
@@ -61,15 +70,17 @@ export function isTauri(): boolean {
  * @param data    要傳遞的資料，會包成 { payload: data }
  */
 export async function send(command: string, data?: unknown): Promise<void> {
-    if (!isTauri()) {
-        console.warn(`[bridge] Tauri 不可用，無法 send "${command}"`);
-        return;
-    }
+    if (!isTauri() || isBlocked(command)) return;
     try {
         const args = data !== undefined ? { payload: data } : {};
         await window.__TAURI__!.core!.invoke(command, args);
     } catch (e) {
-        console.error(`[bridge] send("${command}") 失敗:`, e);
+        // 若因 ACL 被拒，記住並靜默
+        if (String(e).includes('not allowed') || String(e).includes('Plugin not found')) {
+            blockedCommands.add(command);
+        } else {
+            console.error(`[bridge] send("${command}") 失敗:`, e);
+        }
     }
 }
 
@@ -86,6 +97,9 @@ export async function invoke<T = unknown>(
 ): Promise<T> {
     if (!isTauri()) {
         throw new Error(`Tauri 不可用，無法 invoke "${command}"`);
+    }
+    if (isBlocked(command)) {
+        throw new Error(`[bridge] ${command} 已被快取跳過（ACL 限制）`);
     }
     return window.__TAURI__!.core!.invoke(command, args ?? {}) as Promise<T>;
 }
@@ -125,7 +139,7 @@ export function windowClose(): Promise<void> {
  */
 export async function getPlayButtonConfig(): Promise<{ hideOriginalPlayButton: boolean }> {
     const fallback = { hideOriginalPlayButton: true };
-    if (!isTauri()) return fallback;
+    if (!isTauri() || isBlocked('get_play_button_config')) return fallback;
 
     try {
         const timeout = new Promise<{ hideOriginalPlayButton: boolean }>((resolve) =>
@@ -137,16 +151,24 @@ export async function getPlayButtonConfig(): Promise<{ hideOriginalPlayButton: b
         ])) as { hideOriginalPlayButton: boolean } | undefined;
         return result ?? fallback;
     } catch (e) {
-        console.error('[bridge] getPlayButtonConfig 失敗，使用預設值:', e);
+        // 若因 ACL 被拒，靜默記住並停止重試
+        if (String(e).includes('not allowed') || String(e).includes('Plugin not found') || String(e).includes('ACL')) {
+            blockedCommands.add('get_play_button_config');
+        }
         return fallback;
     }
 }
 
 /** 記錄前端日誌（替代 ipcRenderer.invoke('log-message', level, ...args)） */
 export function logMessage(level: string, args: unknown[]): void {
-    if (!isTauri()) return;
-    invoke('log_message', { level, args: args.map((a) => safeStringify(a)) }).catch((e) => {
-        console.error('[bridge] logMessage 失敗:', e);
+    if (!isTauri() || isBlocked('log_message')) return;
+    // 截斷每個參數，防止超大物件（如 fetch 回應體）導致 JSON.stringify 溢位
+    const truncated = args.map((a) => safeStringify(a, 4096));
+    invoke('log_message', { level, args: truncated }).catch((e) => {
+        // 若因 ACL 被拒，靜默記住並停止重試
+        if (String(e).includes('not allowed') || String(e).includes('Plugin not found') || String(e).includes('ACL')) {
+            blockedCommands.add('log_message');
+        }
     });
 }
 
@@ -472,11 +494,17 @@ export function setupElectronAPIShim(): void {
     }
 }
 
-function safeStringify(value: unknown): string {
-    if (typeof value === 'string') return value;
+function safeStringify(value: unknown, maxLen = 0): string {
+    if (typeof value === 'string') {
+        return maxLen > 0 && value.length > maxLen ? value.slice(0, maxLen) + '…[truncated]' : value;
+    }
     try {
-        return JSON.stringify(value);
+        const s = JSON.stringify(value);
+        if (maxLen > 0 && s.length > maxLen) {
+            return s.slice(0, maxLen) + '…[truncated]';
+        }
+        return s;
     } catch {
-        return String(value);
+        return String(value).slice(0, maxLen || 2048);
     }
 }

@@ -990,6 +990,7 @@
     </div>
 
     <script>
+    (function() {
         // ── Tauri / Electron 兼容層 ──────────────────────────
         const isTauri = typeof window !== 'undefined'
             && typeof window.__TAURI__?.core?.invoke === 'function';
@@ -1004,6 +1005,13 @@
          */
         async function tauriInvoke(command, payload) {
             return window.__TAURI__.core.invoke(command, payload !== undefined ? { payload } : {});
+        }
+
+        /**
+         * Tauri invoke 直接呼叫（不包 payload，直接傳命名參數）
+         */
+        async function tauriInvokeDirect(command, args) {
+            return window.__TAURI__.core.invoke(command, args ?? {});
         }
 
         /**
@@ -1031,7 +1039,12 @@
                         break;
                     }
                     case 'login': {
-                        const result = await tauriInvoke('login', data);
+                        const result = await tauriInvokeDirect('login', {
+                            domain: data.domain,
+                            username: data.username,
+                            password: data.password,
+                            use_https: data.useHttps
+                        });
                         if (result.success) {
                             onLoginSuccess(result);
                         } else {
@@ -1043,7 +1056,7 @@
                         await tauriInvoke('clear_history');
                         break;
                     case 'delete-history-item':
-                        await tauriInvoke('delete_history_item', data);
+                        await tauriInvokeDirect('delete_history_item', { domain: data.domain, account: data.account });
                         // 重新載入設定
                         const histResult = await tauriInvoke('get_config');
                         onConfigData(histResult);
@@ -1054,7 +1067,7 @@
                         break;
                     }
                     case 'set-download-proxy':
-                        await tauriInvoke('set_download_proxy_config', data);
+                        await tauriInvokeDirect('set_download_proxy_config', { enabled: data.enabled, proxy_url: data.proxyUrl });
                         onDownloadProxySet({ success: true });
                         break;
                     case 'get-play-button-config': {
@@ -1063,7 +1076,7 @@
                         break;
                     }
                     case 'set-play-button-config':
-                        await tauriInvoke('set_hide_original_play_button', { hide: data.hideOriginalPlayButton });
+                        await tauriInvokeDirect('set_hide_original_play_button', { hide: data.hideOriginalPlayButton });
                         onPlayButtonConfigSet({ success: true });
                         break;
                     case 'get-version':
@@ -1712,6 +1725,7 @@
                 domainInput.focus();
             }, 500);
         });
+    })();
     </script>
 </body>
 
