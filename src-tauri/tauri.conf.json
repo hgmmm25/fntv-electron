@@ -48,15 +48,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true,
-      "scope": [
-        {
-          "name": "proxy",
-          "sidecar": true,
-          "cmd": "proxy",
-          "args": true
-        }
-      ]
+      "open": true
     }
   }
 }
