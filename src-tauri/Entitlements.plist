@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- JIT 编译 (WebView 需要) -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+
+    <!-- 无签名可执行内存 -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+
+    <!-- 禁用库验证 -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+
+    <!-- 动态签名 -->
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key>
+    <true/>
+
+    <!-- 网络访问 -->
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+
+    <!-- 文件读写 -->
+    <key>com.apple.security.files.user-selected.read-write</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-write</key>
+    <true/>
+
+    <!-- 音频输入 -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- 子进程继承 (sidecar 需要) -->
+    <key>com.apple.security.inherit</key>
+    <true/>
+
+    <!-- 启动子进程 (sidecar 需要) -->
+    <key>com.apple.security.process.allow-exec</key>
+    <true/>
+</dict>
+</plist>

@@ -990,11 +990,176 @@
     </div>
 
     <script>
-        const { ipcRenderer } = require('electron'); // 渲染进程可用
-        
-        // 简化的日志接口 - 完全透明使用
-        // 不再需要手动发送IPC，直接使用即可
-        // window.log 已经通过 contextBridge 暴露，会自动处理IPC通信和数据脱敏
+        // ── Tauri / Electron 兼容層 ──────────────────────────
+        const isTauri = typeof window.__TAURI_INTERNALS__ !== 'undefined' && typeof window.__TAURI_INTERNALS__.invoke === 'function';
+        let ipcRenderer = null;
+        if (!isTauri) {
+            // Electron 環境：require('electron') 可用
+            try { ipcRenderer = require('electron').ipcRenderer; } catch(e) { /* ignore */ }
+        }
+
+        /**
+         * Tauri invoke 封裝（替代 ipcRenderer.send + ipcRenderer.on 的事件模式）
+         */
+        async function tauriInvoke(command, payload) {
+            return window.__TAURI_INTERNALS__.invoke(command, payload !== undefined ? { payload } : {});
+        }
+
+        /**
+         * 兼容層：send + on（事件模式） → invoke（Promise 模式）
+         */
+        function ipcSend(command, data) {
+            if (isTauri) {
+                // 將 Electron 的 send 模式轉為 Tauri invoke
+                handleTauriCommand(command, data);
+            } else if (ipcRenderer) {
+                ipcRenderer.send(command, data);
+            }
+        }
+
+        /**
+         * Tauri 命令處理器 — 對應所有 Electron IPC 通道
+         */
+        async function handleTauriCommand(command, data) {
+            try {
+                switch (command) {
+                    case 'get-config': {
+                        const result = await tauriInvoke('get_config');
+                        // 轉換為 Electron 的 config-data 事件格式
+                        onConfigData(result);
+                        break;
+                    }
+                    case 'login': {
+                        const result = await tauriInvoke('login', data);
+                        if (result.success) {
+                            onLoginSuccess(result);
+                        } else {
+                            onLoginError(result);
+                        }
+                        break;
+                    }
+                    case 'clear-history':
+                        await tauriInvoke('clear_history');
+                        break;
+                    case 'delete-history-item':
+                        await tauriInvoke('delete_history_item', data);
+                        // 重新載入設定
+                        const histResult = await tauriInvoke('get_config');
+                        onConfigData(histResult);
+                        break;
+                    case 'get-download-proxy': {
+                        const proxyResult = await tauriInvoke('get_download_proxy_config');
+                        onDownloadProxyInfo(proxyResult);
+                        break;
+                    }
+                    case 'set-download-proxy':
+                        await tauriInvoke('set_download_proxy_config', data);
+                        onDownloadProxySet({ success: true });
+                        break;
+                    case 'get-play-button-config': {
+                        const btnResult = await tauriInvoke('get_hide_original_play_button');
+                        onPlayButtonConfigInfo({ hideOriginalPlayButton: btnResult });
+                        break;
+                    }
+                    case 'set-play-button-config':
+                        await tauriInvoke('set_hide_original_play_button', { hide: data.hideOriginalPlayButton });
+                        onPlayButtonConfigSet({ success: true });
+                        break;
+                    case 'get-version':
+                        onVersionInfo({ version: 'Tauri' });
+                        break;
+                    default:
+                        console.warn('[login] 未知的 Tauri 命令:', command);
+                }
+            } catch (e) {
+                console.error(`[login] Tauri 命令 "${command}" 失敗:`, e);
+                if (command === 'login') {
+                    onLoginError({ title: '連線失敗', message: String(e) });
+                }
+            }
+        }
+
+        // ── Electron 事件回調函數（Tauri 和 Electron 共用）─────────
+        function onConfigData(data) {
+            const { config, history } = data;
+            historyData = history || [];
+            if (config && config.domain) {
+                domainInput.value = config.domain.replace(/^https?:\/\//, '');
+                if (config.useHttps) {
+                    document.getElementById('httpsSwitch').checked = config.useHttps;
+                }
+            }
+            if (config && config.account) {
+                usernameInput.value = config.account;
+            }
+            renderHistoryList();
+            checkInputs();
+        }
+
+        function onLoginError(data) {
+            const { title, message } = data;
+            showCustomMessage('error', title || '登入失敗', message || '未知錯誤');
+            loginBtn.textContent = '登录';
+            checkInputs();
+        }
+
+        function onLoginSuccess(data) {
+            showCustomMessage('success', '登录成功', '正在跳转到主页面...');
+            loginBtn.textContent = '登录';
+            checkInputs();
+            // 導航到主頁面
+            if (data.domain) {
+                setTimeout(() => { window.location.href = data.domain + '/v'; }, 500);
+            }
+        }
+
+        function onHistoryItemDeleted() {
+            ipcSend('get-config');
+        }
+
+        function onDownloadProxyInfo(data) {
+            if (data) {
+                proxyEnabledSwitch.checked = data.enabled !== false;
+                proxyUrlInput.value = data.proxyUrl || 'https://ghfast.top';
+            }
+        }
+
+        function onPlayButtonConfigInfo(data) {
+            if (data) {
+                hideOriginalPlayButtonSwitch.checked = data.hideOriginalPlayButton !== false;
+            }
+        }
+
+        function onDownloadProxySet(data) {
+            if (data && data.success) {
+                console.log('代理设置保存成功');
+            }
+        }
+
+        function onPlayButtonConfigSet(data) {
+            if (data && data.success) {
+                console.log('播放按钮配置保存成功');
+            }
+        }
+
+        function onVersionInfo(data) {
+            if (data && data.version) {
+                versionText.textContent = `版本 ${data.version}`;
+            }
+        }
+
+        // ── Electron 事件監聽（僅在 Electron 環境下啟用）──────
+        if (!isTauri && ipcRenderer) {
+            ipcRenderer.on('config-data', (event, data) => onConfigData(data));
+            ipcRenderer.on('login-error', (event, data) => onLoginError(data));
+            ipcRenderer.on('login-success', (event, data) => onLoginSuccess(data));
+            ipcRenderer.on('history-item-deleted', () => onHistoryItemDeleted());
+            ipcRenderer.on('download-proxy-info', (event, data) => onDownloadProxyInfo(data));
+            ipcRenderer.on('play-button-config-info', (event, data) => onPlayButtonConfigInfo(data));
+            ipcRenderer.on('download-proxy-set', (event, data) => onDownloadProxySet(data));
+            ipcRenderer.on('play-button-config-set', (event, data) => onPlayButtonConfigSet(data));
+            ipcRenderer.on('version-info', (event, data) => onVersionInfo(data));
+        }
         
         const loginBtn = document.getElementById('loginBtn');
         const domainInput = document.getElementById('domain');
@@ -1203,20 +1368,20 @@
         // 登录逻辑
         loginBtn.addEventListener('click', function () {
             if (loginBtn.disabled) return;
-            
+
             // 设置登录中状态
             const originalText = loginBtn.textContent;
             loginBtn.textContent = '登录中...';
             loginBtn.disabled = true;
             loginBtn.classList.remove('enabled');
-            
+
             const domain = domainInput.value.trim();
             const username = usernameInput.value.trim();
             const password = passwordInput.value.trim();
             const useHttps = document.getElementById('httpsSwitch').checked;
 
             window.log.info('登录信息:', { domain, username, password, useHttps });
-            
+
             const loginData = {
                 domain: domain,
                 username: username,
@@ -1224,35 +1389,46 @@
                 useHttps: useHttps
             };
 
-            // 发送登录请求
-            ipcRenderer.send('login', loginData);
-            
-            // 5秒后恢复按钮状态（防止无响应）
-            const timeoutId = setTimeout(() => {
-                loginBtn.textContent = originalText;
-                checkInputs(); // 重新检查输入状态
-            }, 5000);
-            
-            // 监听登录结果，无论成功还是失败都恢复按钮状态
-            const handleLoginResult = () => {
-                clearTimeout(timeoutId);
-                loginBtn.textContent = originalText;
-                checkInputs();
-            };
-            
-            // 临时监听器，处理完后自动移除
-            const tempErrorListener = () => {
-                handleLoginResult();
-                ipcRenderer.off('login-error', tempErrorListener);
-            };
-            
-            const tempSuccessListener = () => {
-                handleLoginResult();
-                ipcRenderer.off('login-success', tempSuccessListener);
-            };
-            
-            ipcRenderer.once('login-error', tempErrorListener);
-            ipcRenderer.once('login-success', tempSuccessListener);
+            // Tauri 環境：直接呼叫 invoke（Promise 模式，結果在 handleTauriCommand 處理）
+            // Electron 環境：使用 send + 事件監聽
+            if (isTauri) {
+                ipcSend('login', loginData);
+                // 5秒後恢復按鈕狀態（防止無回應）
+                setTimeout(() => {
+                    loginBtn.textContent = originalText;
+                    checkInputs();
+                }, 5000);
+            } else {
+                // 發送登录请求（Electron）
+                ipcRenderer.send('login', loginData);
+
+                // 5秒后恢复按钮状态（防止无响应）
+                const timeoutId = setTimeout(() => {
+                    loginBtn.textContent = originalText;
+                    checkInputs();
+                }, 5000);
+
+                // 监听登录结果，无论成功还是失败都恢复按钮状态
+                const handleLoginResult = () => {
+                    clearTimeout(timeoutId);
+                    loginBtn.textContent = originalText;
+                    checkInputs();
+                };
+
+                // 临时监听器，处理完后自动移除
+                const tempErrorListener = () => {
+                    handleLoginResult();
+                    ipcRenderer.off('login-error', tempErrorListener);
+                };
+
+                const tempSuccessListener = () => {
+                    handleLoginResult();
+                    ipcRenderer.off('login-success', tempSuccessListener);
+                };
+
+                ipcRenderer.once('login-error', tempErrorListener);
+                ipcRenderer.once('login-success', tempSuccessListener);
+            }
         });
 
         // Enter 键触发
@@ -1347,7 +1523,7 @@
                         `确定要删除 ${item.account}@${item.domain} 的登录记录吗？`,
                         () => {
                             // 发送删除单个历史记录的请求
-                            ipcRenderer.send('delete-history-item', { domain: item.domain, account: item.account });
+                        ipcSend('delete-history-item', { domain: item.domain, account: item.account });
                         }
                     );
                 });
@@ -1367,7 +1543,7 @@
                     showCustomConfirm(
                         '确定要清除所有历史记录吗？',
                         () => {
-                            ipcRenderer.send('clear-history');
+                            ipcSend('clear-history');
                             historyData = [];
                             renderHistoryList();
                         }
@@ -1378,7 +1554,7 @@
 
         // 加载配置和历史记录
         function loadConfigData() {
-            ipcRenderer.send('get-config');
+            ipcSend('get-config');
         }
 
         // 监听配置数据返回
@@ -1453,9 +1629,13 @@
             if (e.target.classList.contains('github-link')) {
                 e.preventDefault(); // 阻止默认行为
                 const url = e.target.href;
-                // 使用Electron的shell模块在外部浏览器打开链接
-                const { shell } = require('electron');
-                shell.openExternal(url);
+                // Tauri: 使用 window.open；Electron: 使用 shell.openExternal
+                if (isTauri) {
+                    window.open(url, '_blank');
+                } else {
+                    const { shell } = require('electron');
+                    shell.openExternal(url);
+                }
             }
         });
 
@@ -1480,7 +1660,7 @@
         // 更新检查相关函数
         function initVersionInfo() {
             // 获取版本信息
-            ipcRenderer.send('get-version');
+            ipcSend('get-version');
         }
 
         function handleUpdateCheck() {
@@ -1493,7 +1673,7 @@
             btn.disabled = true;
             
             // 发送检查更新请求
-            ipcRenderer.send('check-update');
+            ipcSend('check-update');
             
             // 5秒后恢复按钮状态（防止无响应）
             setTimeout(() => {
@@ -1516,9 +1696,9 @@
         // 代理设置相关函数
         function initProxySettings() {
             // 获取当前代理设置
-            ipcRenderer.send('get-download-proxy');
+            ipcSend('get-download-proxy');
             // 获取当前播放按钮配置
-            ipcRenderer.send('get-play-button-config');
+            ipcSend('get-play-button-config');
         }
 
         function toggleProxyPanel() {
@@ -1535,13 +1715,13 @@
             const hideOriginalPlayButton = hideOriginalPlayButtonSwitch.checked;
             
             // 保存代理设置
-            ipcRenderer.send('set-download-proxy', { 
+            ipcSend('set-download-proxy', {
                 enabled: enabled,
                 proxyUrl: proxyUrl || 'https://ghfast.top'
             });
             
             // 保存播放按钮配置
-            ipcRenderer.send('set-play-button-config', {
+            ipcSend('set-play-button-config', {
                 hideOriginalPlayButton: hideOriginalPlayButton
             });
             

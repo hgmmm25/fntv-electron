@@ -1,0 +1,76 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/tauri/tauri_conf_schema.json",
+  "productName": "飞牛影视",
+  "version": "2.6.1",
+  "identifier": "com.qiaokes.fntv",
+  "build": {
+    "frontendDist": "../resource/login",
+    "devUrl": "http://localhost:3000",
+    "beforeDevCommand": "node scripts/build-inject.mjs",
+    "beforeBuildCommand": "node scripts/build-inject.mjs"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "飞牛影视",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "decorations": true
+      }
+    ],
+    "withGlobalTauri": true,
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/proxy"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "displayLanguageSelector": false
+      }
+    },
+    "macOS": {
+      "entitlements": "./Entitlements.plist",
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": null
+    },
+    "linux": {
+      "deb": {
+        "desktopTemplate": null
+      }
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true,
+      "scope": [
+        {
+          "name": "proxy",
+          "sidecar": true,
+          "cmd": "proxy",
+          "args": true,
+          "scope": [
+            { "validator": "^(--lang|127\\.0\\.0\\.1:\\d+)$" }
+          ]
+        }
+      ]
+    }
+  }
+}
