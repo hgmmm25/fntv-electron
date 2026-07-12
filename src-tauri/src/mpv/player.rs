@@ -2,6 +2,36 @@
 //!
 //! 封裝 MPV 進程的啟動、IPC 連接、播放控制、屬性監聽與狀態管理。
 //! 對應 TypeScript 版 `src/modules/players/impl/mpv.ts` 的功能。
+//!
+//! ## 架構：獨立進程模式（Independent Window）
+//!
+//! MPV 作為**完全獨立的外部進程**運行，透過 IPC（JSON-RPC over Unix socket /
+//! Windows named pipe）與 Tauri 應用通訊。這意味著：
+//!
+//! - MPV 擁有自己的原生視窗（由 mpv 自行建立和管理）
+//! - Tauri 主視窗與 MPV 視窗是兩個獨立的 OS 視窗
+//! - 兩者之間**沒有** HWND 綁定或視窗嵌入
+//!
+//! ### 為什麼選擇獨立進程而非嵌入？
+//!
+//! 1. **穩定性**：MPV 嵌入 HWND 可能導致渲染衝突（尤其是 GPU 加速時）
+//! 2. **跨平台**：HWND 嵌入僅 Windows 可靠（macOS 的 NSView 嵌入複雜度高）
+//! 3. **靈活性**：獨立視窗可自由移動、多顯示器支持、系統 Alt+Tab 正常
+//! 4. **對齊 Electron 版**：Electron 版也是 spawn 獨立 mpv 進程
+//!
+//! ### 主視窗與 MPV 視窗的聯動（目前未實作）
+//!
+//! 若要實現視窗聯動（同步縮放、移動、置頂），需要：
+//!
+//! - **Windows**：使用 `--wid=<HWND>` 將 MPV 嵌入 Tauri webview 的原生視窗，
+//!   或透過 `FindWindow` 取得 MPV 視窗句柄後用 `SetWindowPos` 同步位置。
+//! - **macOS**：需要透過 NSWindow API 取得 MPV 視窗（`mpv_get_property("window-handle")`），
+//!   然後用 Core Graphics API 同步位置。
+//! - **Linux**：透過 X11 `XFindWindow` 或 Wayland 協議取得視窗句柄。
+//!
+//! 由於當前架構為「MPV 全屏獨立播放」（對應 Electron 版的行為），
+//! 視窗聯動的需求較低。如需此功能，建議在 `mpv::commands` 模組新增
+//! `mpv_get_window_handle` 和 `mpv_sync_window_position` 兩個 command。
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

@@ -1,6 +1,11 @@
 //! Tauri Commands — MPV 播放控制
 //!
 //! 前端透過 `invoke('command_name', { args })` 呼叫這些函數。
+//!
+//! ## 架構說明
+//!
+//! MPV 作為獨立外部進程運行，透過 IPC 與本模組通訊。
+//! 視窗嵌入（HWND binding）目前未實作——詳見 `player.rs` 模組文件。
 
 use std::sync::Arc;
 use tauri::State;

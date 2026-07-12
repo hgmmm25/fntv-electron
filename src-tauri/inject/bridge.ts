@@ -8,11 +8,30 @@
 // 1. 所有 invoke 都走 __TAURI_INTERNALS__，Tauri 核心會驗證 capabilities
 // 2. 載荷包成 { payload } 單一參數，避免 command 引數展開問題
 // 3. invoke 失敗時 reject，呼叫端可自行處理（不吞錯）
+//
+// ## window.electronAPI 兼容層
+//
+// 為了與依賴 Electron preload API 的遠端頁面保持兼容，本模組在最後
+// 建立 `window.electronAPI` 物件，映射 Electron 的 IPC 介面：
+//   - send(channel, ...args)  → invoke('channel', { payload: args })
+//   - invoke(channel, ...args) → invoke('channel', { payload: args })
+//   - on(channel, callback)   → Tauri event listen (需配合 Rust 端 emit)
+//   - once(channel, callback)  → Tauri event once
+//
+// 注意：Tauri 的事件系統（emit/listen）與 Electron 的 IPC 通道不同，
+// on/once 僅適用於 Rust 端透過 `app.emit()` 發送的事件。
 
 declare global {
     interface Window {
         __TAURI_INTERNALS__?: {
             invoke: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>;
+            listen?: (event: string, handler: (event: { payload: unknown }) => void) => Promise<() => void>;
+        };
+        electronAPI?: {
+            send: (channel: string, ...args: unknown[]) => void;
+            invoke: (channel: string, ...args: unknown[]) => Promise<unknown>;
+            on: (channel: string, callback: (...args: unknown[]) => void) => () => void;
+            once: (channel: string, callback: (...args: unknown[]) => void) => () => void;
         };
     }
 }
@@ -256,6 +275,175 @@ export function setDownloadProxyConfig(data: {
  */
 export function setHideOriginalPlayButton(hide: boolean): Promise<void> {
     return invoke('set_hide_original_play_button', { hide });
+}
+
+// ─── window.electronAPI 兼容層 ──────────────────────────────
+
+/**
+ * 建立 `window.electronAPI` 兼容物件。
+ *
+ * 這讓依賴 Electron preload API 的遠端頁面代碼能透明運行。
+ * 映射關係：
+ *   - electronAPI.send(channel, ...args)    →  Tauri invoke(channel, { payload: args })
+ *   - electronAPI.invoke(channel, ...args)  →  Tauri invoke(channel, { payload: args })
+ *   - electronAPI.on(channel, callback)     →  Tauri event listener（需配合 Rust emit）
+ *   - electronAPI.once(channel, callback)   →  Tauri 一次性 event listener
+ *
+ * 安全注意：
+ * - 只有已知的 channel 允許通過（白名單機制）
+ * - 未知 channel 會被攔截並記錄警告
+ */
+export function setupElectronAPIShim(): void {
+    if (typeof window === 'undefined') return;
+    if (window.electronAPI) return; // 避免重複設定
+
+    /** 已知的安全 channel 白名單 */
+    const KNOWN_CHANNELS = new Set([
+        'play-movie',
+        'get-play-button-config',
+        'log-message',
+        'window-minimize',
+        'window-maximize',
+        'window-close',
+        'get-config',
+        'save-config',
+        'get-history',
+        'add-history',
+        'clear-history',
+        'delete-history-item',
+        'login',
+        'restore-cookies',
+        'get-download-proxy-config',
+        'set-download-proxy-config',
+        'set-hide-original-play-button',
+    ]);
+
+    /**
+     * Electron channel 名稱 → Tauri command 名稱映射
+     * Electron 使用 kebab-case，Tauri 使用 snake_case
+     */
+    const channelToCommand: Record<string, string> = {
+        'play-movie': 'play_movie',
+        'get-play-button-config': 'get_play_button_config',
+        'log-message': 'log_message',
+        'window-minimize': 'window_minimize',
+        'window-maximize': 'window_toggle_maximize',
+        'window-close': 'window_close',
+        'get-config': 'get_config',
+        'save-config': 'save_login_config',
+        'get-history': 'get_history',
+        'add-history': 'add_history',
+        'clear-history': 'clear_history',
+        'delete-history-item': 'delete_history_item',
+        'login': 'login',
+        'restore-cookies': 'restore_cookies',
+        'get-download-proxy-config': 'get_download_proxy_config',
+        'set-download-proxy-config': 'set_download_proxy_config',
+        'set-hide-original-play-button': 'set_hide_original_play_button',
+    };
+
+    function mapChannel(channel: string): string | null {
+        const cmd = channelToCommand[channel];
+        if (cmd) return cmd;
+        if (!KNOWN_CHANNELS.has(channel)) {
+            console.warn(`[electronAPI] 未知的 channel: "${channel}"，已攔截`);
+        }
+        return null;
+    }
+
+    window.electronAPI = {
+        /**
+         * fire-and-forget（對應 ipcRenderer.send）
+         * 所有參數包進 payload 傳給 Tauri command
+         */
+        send(channel: string, ...args: unknown[]): void {
+            const cmd = mapChannel(channel);
+            if (!cmd) return;
+            const payload = args.length === 1 ? args[0] : args;
+            sendToRust(cmd, payload);
+        },
+
+        /**
+         * request-reply（對應 ipcRenderer.invoke）
+         * 回傳 Promise，可被 await
+         */
+        invoke(channel: string, ...args: unknown[]): Promise<unknown> {
+            const cmd = mapChannel(channel);
+            if (!cmd) return Promise.reject(new Error(`未知的 channel: ${channel}`));
+            const payload = args.length === 1 ? args[0] : args;
+            return invokeFromRust(cmd, typeof payload === 'object' && payload !== null
+                ? payload as Record<string, unknown>
+                : { payload });
+        },
+
+        /**
+         * 事件監聽（對應 ipcRenderer.on）
+         * 使用 Tauri 的 listen API（如果可用）
+         */
+        on(channel: string, callback: (...args: unknown[]) => void): () => void {
+            if (!window.__TAURI_INTERNALS__?.listen) {
+                console.warn('[electronAPI] Tauri listen API 不可用');
+                return () => {};
+            }
+
+            // Tauri 事件名稱使用 tauri:// 前綴的 channel
+            const eventName = `app://internal/${channel}`;
+            let unlistenFn: (() => void) | null = null;
+
+            window.__TAURI_INTERNALS__.listen(eventName, (event) => {
+                callback(event.payload);
+            }).then((unlisten) => {
+                unlistenFn = unlisten;
+            }).catch((e) => {
+                console.warn(`[electronAPI] listen("${channel}") 失敗:`, e);
+            });
+
+            return () => {
+                unlistenFn?.();
+            };
+        },
+
+        /**
+         * 一次性事件監聽（對應 ipcRenderer.once）
+         */
+        once(channel: string, callback: (...args: unknown[]) => void): () => void {
+            if (!window.__TAURI_INTERNALS__?.listen) {
+                return () => {};
+            }
+
+            const eventName = `app://internal/${channel}`;
+            let unlistenFn: (() => void) | null = null;
+
+            window.__TAURI_INTERNALS__.listen(eventName, (event) => {
+                callback(event.payload);
+                unlistenFn?.();
+            }).then((unlisten) => {
+                unlistenFn = unlisten;
+            }).catch((e) => {
+                console.warn(`[electronAPI] once("${channel}") 失敗:`, e);
+            });
+
+            return () => {
+                unlistenFn?.();
+            };
+        },
+    };
+
+    console.info('[bridge] window.electronAPI 已建立（Electron 兼容層）');
+
+    // 內部 helper——避免與上方模組級 send/invoke 函數名稱衝突
+    function sendToRust(command: string, data?: unknown): void {
+        if (!isTauri()) return;
+        const args = data !== undefined ? { payload: data } : {};
+        window.__TAURI_INTERNALS__!.invoke(command, args).catch((e) => {
+            console.error(`[electronAPI] send("${command}") 失敗:`, e);
+        });
+    }
+
+    function invokeFromRust(command: string, args?: Record<string, unknown>): Promise<unknown> {
+        if (!isTauri()) return Promise.reject(new Error('Tauri 不可用'));
+        return window.__TAURI_INTERNALS__!.invoke(command, args ?? {});
+    }
 }
 
 function safeStringify(value: unknown): string {

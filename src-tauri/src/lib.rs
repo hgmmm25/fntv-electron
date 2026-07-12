@@ -2,10 +2,21 @@
 //!
 //! 職責：
 //! 1. 初始化 Tauri 插件（shell 用於 sidecar）
-//! 2. 啟動 Go proxy sidecar 並註冊守護程序
+//! 2. 啟動 Go proxy sidecar 並註冊守護程序（含防孤兒機制）
 //! 3. 註冊 MPV 播放器 commands
 //! 4. 註冊 Frontend Bridge commands（play_movie, get_play_button_config, log_message）
 //! 5. 在主視窗載入前注入初始化腳本（src-tauri/inject/preload.iife.js）
+//! 6. 處理所有退出路徑（正常退出、托盤退出、關閉按鈕、異常退出），
+//!    確保 Go sidecar 被徹底 kill，不留孤兒進程。
+//!
+//! ## 防孤兒進程設計（第二輪重構）
+//!
+//! 核心改動：`proxy_daemon::ChildCell` 在 `setup()` 最前面就被 `manage()`，
+//! 然後才啟動 sidecar。這樣不論什麼時候收到退出請求，都能可靠地取得子進程句柄。
+//!
+//! 退出路徑覆蓋：
+//! - `RunEvent::ExitRequested` — 用戶點 X / tray 退出 / app.exit() 時觸發
+//! - `RunEvent::Exit` — 進程真正退出前的最後一道保障
 
 mod auth;
 mod bridge;
@@ -25,11 +36,18 @@ pub fn run() {
     // 建立預設的 MpvPlayer（尚未啟動，需前端呼叫 mpv_launch）
     let mpv_player = mpv::player::MpvPlayer::new(mpv::player::MpvConfig::default());
 
+    // 預先建立共享子進程容器（防孤兒機制的核心）
+    let child_cell = proxy_daemon::new_child_cell();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .setup(|app| {
-            // ── 管理狀態 ──────────────────────────────────────
+        .setup(move |app| {
+            // ── 共享子進程容器（最先 manage，確保退出處理隨時可取）────
+            app.manage(child_cell.clone());
+
             let handle = app.handle().clone();
+
+            // ── 管理狀態 ──────────────────────────────────────
 
             // MPV 播放器狀態
             handle.manage(mpv::commands::MpvPlayerState {
@@ -37,9 +55,13 @@ pub fn run() {
             });
 
             // ── Proxy 守護程序 ────────────────────────────────
+            //
+            // 注意：這裡在 setup() 中同步啟動 proxy（透過 async_runtime::spawn），
+            // 但 child_cell 已經在上面 manage()，所以即使 sidecar 啟動、
+            // daemon 還沒 manage 完，退出處理也能透過 ChildCell kill 子進程。
             let proxy_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
-                match proxy_daemon::start_proxy_daemon(&proxy_handle).await {
+                match proxy_daemon::start_proxy_daemon(&proxy_handle, child_cell.clone()).await {
                     Ok(daemon) => {
                         proxy_handle.manage(daemon);
                         log::info!("Proxy 守護程序已就緒");
@@ -59,10 +81,6 @@ pub fn run() {
             //
             // 讀取由 `scripts/build-inject.mjs` 打包的 IIFE JS，
             // 透過 Tauri 的 initialization_script API 在頁面 DOMReady 前注入。
-            //
-            // 使用 runtime 讀取而非 include_str!，這樣：
-            // 1. 開發時不需要每次改 Rust 就重編譯
-            // 2. 檔案不存在時降級為空字串（app 仍可運行，只是沒有注入腳本）
             let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
                 .unwrap_or_else(|_| ".".to_string());
             let inject_path = std::path::Path::new(&manifest_dir)
@@ -89,9 +107,6 @@ pub fn run() {
             };
 
             // ── 設定檔 Cookie 恢復 ──────────────────────────
-            //
-            // 啟動時讀取設定檔，若已有 token + domain，在頁面載入後
-            // 透過 eval 注入 cookie 設定腳本（對應 Electron 的 setupCookieRestore）。
             let saved_config = config::read_config(&handle);
             if let (Some(domain), Some(token)) =
                 (saved_config.domain.clone(), saved_config.token.clone())
@@ -109,8 +124,6 @@ pub fn run() {
                         secure = secure,
                         same_site = same_site,
                     );
-                    // 與注入腳本合併，一起 eval
-                    // （注入腳本本身不負責 cookie，這裡獨立 eval 一次以確保 cookie 先設定）
                     let combined = format!("{}\n{}", cookie_js, inject_js);
 
                     if let Some(window) = handle.get_webview_window("main") {
@@ -184,26 +197,49 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    // 透過 App::run 註冊事件回調，處理退出前的資源關閉
+    // ── 退出處理 ─────────────────────────────────────────────────
+    //
+    // 覆蓋兩種退出事件，確保不論哪條路徑退出都能清理子進程：
+    //
+    // `ExitRequested`：用戶點 X、托盤選退出、程式內部呼叫 app.exit() 時觸發。
+    //   這裡做「軟清理」——通知 MPV 退出、kill sidecar。
+    //
+    // `Exit`：進程真正退出前的最後一道保障。
+    //   這裡做「硬 kill」——不論前面是否已清理，再次嘗試 kill sidecar。
+    //   這涵蓋了：ExitRequested 被 skip（e.g., prevent_close）、
+    //   block_on 阻塞、runtime 拆除導致的異常退出等邊界情況。
+    //
+    // 兩個 handler 都是「最多做一次 kill」——因為 ChildCell 用 Option + Mutex，
+    // 第一次 take() 取出後 cell 為 None，第二次 take() 直接拿到 None，無副作用。
     app.run(|app_handle, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            log::info!("收到退出請求，關閉資源...");
+        match event {
+            tauri::RunEvent::ExitRequested { .. } => {
+                log::info!("收到 ExitRequested，執行資源清理...");
 
-            // 關閉 MPV 播放器
-            if let Some(mpv_state) =
-                app_handle.try_state::<mpv::commands::MpvPlayerState>()
-            {
-                let player = mpv_state.player.clone();
-                tauri::async_runtime::block_on(async move {
-                    let mut p = player.write().await;
-                    p.shutdown().await;
+                // 1. 關閉 MPV 播放器（嘗試 tokio，失敗則略過——MPV 有 kill_on_drop）
+                let _ = tauri::async_runtime::block_on(async {
+                    if let Some(mpv_state) =
+                        app_handle.try_state::<mpv::commands::MpvPlayerState>()
+                    {
+                        let player = mpv_state.player.clone();
+                        let mut p = player.write().await;
+                        p.shutdown().await;
+                    }
                 });
-            }
 
-            // 關閉 Proxy 守護程序
-            tauri::async_runtime::block_on(
-                proxy_daemon::shutdown_proxy_daemon(app_handle),
-            );
+                // 2. 同步 kill Go sidecar（不依賴 tokio runtime）
+                proxy_daemon::kill_sidecar_sync(app_handle);
+            }
+            tauri::RunEvent::Exit => {
+                log::info!("收到 Exit 事件，執行最終清理...");
+
+                // 最後一道保障：再次嘗試 kill sidecar
+                // （如果 ExitRequested 已經 kill 過，這裡 take() 返回 None，無副作用）
+                proxy_daemon::kill_sidecar_sync(app_handle);
+
+                log::info!("最終清理完成");
+            }
+            _ => {}
         }
     });
 }

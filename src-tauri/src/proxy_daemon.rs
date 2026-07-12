@@ -4,14 +4,45 @@
 //! - 進程啟動 / 監控 / 重啟 / 關閉
 //! - 心跳檢測（定期驗證進程存活）
 //! - 異常退出後自動重啟（可配置最大次數與重置時間）
+//! - 防孤兒進程機制（共享子進程句柄，退出時同步強制 kill）
+//!
+//! ## 架構重點（第二輪重構）
+//!
+//! 為了徹底防止「主進程退出但 Go sidecar 仍在運行」的孤兒進程問題，
+//! 採用「共享子進程句柄」設計：
+//!
+//! 1. `child_cell: Arc<std::sync::Mutex<Option<CommandChild>>>` 是唯一的子進程持有者，
+//!    同時被 `ProxyDaemon`（守護邏輯）與 `tauri::State`（退出處理）共享。
+//! 2. 使用 **`std::sync::Mutex`** 而非 tokio Mutex —— 因為 `CommandChild::kill()` 是同步
+//!    且極短的操作，且退出處理發生在主執行緒，此時 tokio runtime 可能已在拆除中，
+//!    同步鎖確保 `kill()` 不依賴 runtime 仍存活。
+//! 3. `lib.rs::setup()` 在啟動 sidecar **之前**就 `manage()` 這個 cell，
+//!    消除「sidecar 已啟動但 state 尚未註冊」的競態。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::AppHandle;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent, TerminatedPayload};
 use tauri_plugin_shell::ShellExt;
-use tokio::sync::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
+
+// ─── 共享子進程句柄 ─────────────────────────────────────────────────
+
+/// 子進程句柄的共享容器。
+///
+/// 這是防孤兒機制的核心：無論守護邏輯處於何種狀態（重啟中、心跳中），
+/// 退出處理都能拿到當前的子進程並同步 kill。
+///
+/// 使用 `std::sync::Mutex` 而非 `tokio::sync::Mutex`，原因：
+/// - `CommandChild::kill()` 是同步呼叫，持鎖時間極短（毫秒級）
+/// - 退出處理在主執行緒執行，不能依賴 tokio runtime（可能已拆除）
+pub type ChildCell = Arc<Mutex<Option<CommandChild>>>;
+
+/// 建立一個空的共享子進程容器（供 `lib.rs::setup()` 預先 manage）
+pub fn new_child_cell() -> ChildCell {
+    Arc::new(Mutex::new(None))
+}
 
 // ─── 配置 ───────────────────────────────────────────────────────────
 
@@ -44,14 +75,14 @@ impl Default for ProxyDaemonConfig {
 
 // ─── 內部狀態 ───────────────────────────────────────────────────────
 
-struct DaemonState {
-    /// 當前子進程句柄（持有產權，kill 時需 take）
-    child: Option<CommandChild>,
-    /// 是否正在關閉中
+/// 守護邏輯的簿記狀態（不含子進程句柄——子進程在共享 cell 中）
+struct DaemonBookkeeping {
+    /// 是否正在關閉中（阻止重啟）
     is_shutting_down: bool,
     /// 連續重啟次數
     restart_attempts: u32,
     /// 上次重啟時間
+    #[allow(dead_code)]
     last_restart_time: Option<Instant>,
     /// 重啟計數重置定時器（到期後自動歸零）
     reset_timer: Option<tokio::task::JoinHandle<()>>,
@@ -61,26 +92,31 @@ struct DaemonState {
 
 /// Proxy 守護程序
 ///
-/// 透過 `Arc<ProxyDaemon>` 共享，存放於 Tauri managed state。
-/// 所有進程操作均為非同步，由 tokio runtime 驅動。
+/// 透過 `Arc<ProxyDaemon>` 共享。子進程句柄獨立存於 `child_cell`（同時由
+/// `tauri::State` 持有），確保退出時能可靠 kill。
 pub struct ProxyDaemon {
     config: ProxyDaemonConfig,
-    state: Arc<Mutex<DaemonState>>,
+    bookkeeping: Arc<AsyncMutex<DaemonBookkeeping>>,
+    /// 共享子進程句柄（與 managed state 同一個 Arc）
+    child_cell: ChildCell,
     app: AppHandle,
 }
 
 impl ProxyDaemon {
-    /// 建立新的守護程序實例（不自動啟動）
-    pub fn new(app: AppHandle, config: ProxyDaemonConfig) -> Arc<Self> {
+    /// 建立守護程序實例，綁定到預先建立的 `child_cell`
+    ///
+    /// `child_cell` 應由 `lib.rs::setup()` 預先建立並 `manage()`，
+    /// 確保退出處理隨時能存取子進程句柄。
+    pub fn new(app: AppHandle, config: ProxyDaemonConfig, child_cell: ChildCell) -> Arc<Self> {
         Arc::new(Self {
             config,
-            state: Arc::new(Mutex::new(DaemonState {
-                child: None,
+            bookkeeping: Arc::new(AsyncMutex::new(DaemonBookkeeping {
                 is_shutting_down: false,
                 restart_attempts: 0,
                 last_restart_time: None,
                 reset_timer: None,
             })),
+            child_cell,
             app,
         })
     }
@@ -114,13 +150,13 @@ impl ProxyDaemon {
             .spawn()
             .map_err(|e| format!("啟動 sidecar 失敗: {e}"))?;
 
-        // 存入 state（清理舊進程）
+        // 存入共享 cell（清理舊進程）
         {
-            let mut state = self.state.lock().await;
-            if let Some(old) = state.child.take() {
+            let mut cell = self.child_cell.lock().expect("child_cell poisoned");
+            if let Some(old) = cell.take() {
                 let _ = old.kill();
             }
-            state.child = Some(child);
+            *cell = Some(child);
         }
 
         // 啟動事件監聽任務
@@ -156,9 +192,15 @@ impl ProxyDaemon {
                 }
                 CommandEvent::Terminated(TerminatedPayload { code, signal }) => {
                     let is_shutting_down = {
-                        let state = self.state.lock().await;
-                        state.is_shutting_down
+                        let bk = self.bookkeeping.lock().await;
+                        bk.is_shutting_down
                     };
+
+                    // 清除共享 cell 中已退出的句柄
+                    {
+                        let mut cell = self.child_cell.lock().expect("child_cell poisoned");
+                        *cell = None;
+                    }
 
                     if is_shutting_down {
                         log::info!("Proxy 進程正常關閉 (code: {code:?}, signal: {signal:?})");
@@ -179,10 +221,15 @@ impl ProxyDaemon {
         }
         // channel 關閉（進程已結束但未收到 Terminated）
         let is_shutting_down = {
-            let state = self.state.lock().await;
-            state.is_shutting_down
+            let bk = self.bookkeeping.lock().await;
+            bk.is_shutting_down
         };
         if !is_shutting_down {
+            // 清除 cell
+            {
+                let mut cell = self.child_cell.lock().expect("child_cell poisoned");
+                *cell = None;
+            }
             log::warn!("Proxy 事件通道已關閉（未收到 Terminated），嘗試重啟");
             self.handle_process_exit();
         }
@@ -192,7 +239,7 @@ impl ProxyDaemon {
 
     /// 定期檢查 sidecar 進程是否存活
     ///
-    /// 與 TypeScript 版本一致：透過 PID + 平台 API 判斷進程是否仍存在。
+    /// 透過 PID + 平台 API 判斷進程是否仍存在。
     /// 若已死亡，觸發 `handle_process_exit` 進行重啟。
     async fn heartbeat_loop(self: &Arc<Self>) {
         let mut ticker = interval(self.config.heartbeat_interval);
@@ -202,9 +249,14 @@ impl ProxyDaemon {
             ticker.tick().await;
 
             let (pid, is_shutting_down) = {
-                let state = self.state.lock().await;
-                let pid = state.child.as_ref().map(|c| c.pid());
-                (pid, state.is_shutting_down)
+                let bk = self.bookkeeping.lock().await;
+                let pid = self
+                    .child_cell
+                    .lock()
+                    .expect("child_cell poisoned")
+                    .as_ref()
+                    .map(|c| c.pid());
+                (pid, bk.is_shutting_down)
             };
 
             if is_shutting_down {
@@ -214,6 +266,11 @@ impl ProxyDaemon {
             match pid {
                 Some(pid) if !is_process_alive(pid) => {
                     log::warn!("心跳檢測：Proxy 進程 (pid={pid}) 已不存在");
+                    // 清除失效句柄
+                    {
+                        let mut cell = self.child_cell.lock().expect("child_cell poisoned");
+                        *cell = None;
+                    }
                     self.handle_process_exit();
                     return;
                 }
@@ -231,26 +288,20 @@ impl ProxyDaemon {
 
     /// 處理進程異常退出：檢查重啟次數 → 調度重啟 or 強制退出應用
     ///
-    /// 此方法是同步的——它只讀寫 state 並 spawn async task 來執行實際重啟。
-    /// 這避免了 `handle_process_exit` ↔ `spawn_sidecar` ↔ `event_listener`
-    /// 之間的 async fn 類型遞迴循環。
+    /// 此方法是同步的——它只讀寫 state 並 spawn async task 來執行實際重啟，
+    /// 避免 async fn 類型遞迴循環。
     fn handle_process_exit(self: &Arc<Self>) {
         let daemon = Arc::clone(self);
 
-        // 在背景 task 中執行（避免阻塞事件監聽器）
         tokio::spawn(async move {
-            let should_restart;
             let attempts;
             let delay;
 
             {
-                let mut state = daemon.state.lock().await;
-
-                // 清除子進程
-                state.child = None;
+                let mut bk = daemon.bookkeeping.lock().await;
 
                 // 達到上限 → 退出應用
-                if state.restart_attempts >= daemon.config.max_restart_attempts {
+                if bk.restart_attempts >= daemon.config.max_restart_attempts {
                     log::error!(
                         "Proxy 進程頻繁異常退出，已達最大重啟次數 ({})，應用即將退出",
                         daemon.config.max_restart_attempts
@@ -264,34 +315,28 @@ impl ProxyDaemon {
                 }
 
                 // 計數 +1
-                state.restart_attempts += 1;
-                state.last_restart_time = Some(Instant::now());
-                attempts = state.restart_attempts;
+                bk.restart_attempts += 1;
+                bk.last_restart_time = Some(Instant::now());
+                attempts = bk.restart_attempts;
                 delay = daemon.config.restart_delay;
 
                 // 重置之前的 reset timer
-                if let Some(timer) = state.reset_timer.take() {
+                if let Some(timer) = bk.reset_timer.take() {
                     timer.abort();
                 }
 
                 // 啟動新的 reset timer
-                let state_clone = Arc::clone(&daemon.state);
+                let bk_arc = Arc::clone(&daemon.bookkeeping);
                 let reset_duration = daemon.config.restart_attempt_reset_time;
                 let timer = tokio::spawn(async move {
                     tokio::time::sleep(reset_duration).await;
-                    let mut s = state_clone.lock().await;
+                    let mut s = bk_arc.lock().await;
                     if s.restart_attempts > 0 {
                         log::info!("重啟計數已重置 (之前: {} 次)", s.restart_attempts);
                         s.restart_attempts = 0;
                     }
                 });
-                state.reset_timer = Some(timer);
-
-                should_restart = true;
-            }
-
-            if !should_restart {
-                return;
+                bk.reset_timer = Some(timer);
             }
 
             log::info!("準備重啟 Proxy 進程 (第 {attempts} 次嘗試)...");
@@ -304,63 +349,43 @@ impl ProxyDaemon {
         });
     }
 
-    // ─── 優雅關閉 ───────────────────────────────────────────────────
+    // ─── 優雅關閉（同步，可在無 tokio runtime 時呼叫）──────────────
 
-    /// 關閉守護程序與 sidecar 進程
+    /// **同步**關閉 sidecar 進程——防孤兒機制的關鍵路徑。
     ///
-    /// 對應 TypeScript 版本的 `shutdown()` 方法：
-    /// 1. 設定 `is_shutting_down` 標誌（停止重啟邏輯）
-    /// 2. 清除 reset timer
-    /// 3. 發送 kill 給子進程
-    pub async fn shutdown(&self) {
-        log::info!("Proxy 守護程序正在關閉...");
-
-        let child = {
-            let mut state = self.state.lock().await;
-            state.is_shutting_down = true;
-
-            // 停止 reset timer
-            if let Some(timer) = state.reset_timer.take() {
+    /// 此方法設計為可從 `RunEvent::ExitRequested` / `RunEvent::Exit` 主執行緒回調中
+    /// 直接呼叫，**不依賴 tokio runtime 仍存活**：
+    /// 1. 標記 shutting down（阻止重啟，用 try_lock 容忍競態）
+    /// 2. 從共享 cell 取出子進程句柄
+    /// 3. 同步 `kill()`
+    ///
+    /// 若 bookkeeping 鎖被佔用（例如重啟邏輯正在跑），不阻塞退出——
+    /// 因為 kill 子進程才是最關鍵的，重啟旗標在進程退出後已無意義。
+    pub fn kill_child_sync(&self) {
+        // 嘗試標記關閉中（非阻塞，失敗也不影響 kill）
+        if let Ok(mut bk) = self.bookkeeping.try_lock() {
+            bk.is_shutting_down = true;
+            if let Some(timer) = bk.reset_timer.take() {
                 timer.abort();
             }
-
-            // 取出子進程句柄（CommandChild::kill 取得產權）
-            state.child.take()
-        };
-
-        // 關閉子進程
-        if let Some(child) = child {
-            match child.kill() {
-                Ok(()) => log::info!("Proxy 進程已終止"),
-                Err(e) => log::warn!("關閉 Proxy 進程時出錯: {e}"),
-            }
+        } else {
+            log::warn!("bookkeeping 鎖被佔用，跳過關閉旗標設定（仍會 kill 子進程）");
         }
 
-        log::info!("Proxy 守護程序已關閉");
-    }
+        // 取出並 kill 子進程（同步，持鎖極短）
+        let child = {
+            let mut cell = self.child_cell.lock().expect("child_cell poisoned");
+            cell.take()
+        };
 
-    // ─── 查詢介面 ───────────────────────────────────────────────────
-    // 這些方法預留給未來的 Tauri commands（從前端查詢 proxy 狀態）使用。
-
-    /// 當前重啟嘗試次數
-    #[allow(dead_code)]
-    pub async fn restart_attempts(&self) -> u32 {
-        let state = self.state.lock().await;
-        state.restart_attempts
-    }
-
-    /// 是否正在關閉中
-    #[allow(dead_code)]
-    pub async fn is_shutting_down(&self) -> bool {
-        let state = self.state.lock().await;
-        state.is_shutting_down
-    }
-
-    /// 當前 sidecar 的 PID（若正在運行）
-    #[allow(dead_code)]
-    pub async fn pid(&self) -> Option<u32> {
-        let state = self.state.lock().await;
-        state.child.as_ref().map(|c| c.pid())
+        if let Some(child) = child {
+            match child.kill() {
+                Ok(()) => log::info!("Proxy 進程已終止 (sync kill)"),
+                Err(e) => log::warn!("關閉 Proxy 進程時出錯: {e}"),
+            }
+        } else {
+            log::info!("Proxy 子進程不存在或已退出（無需 kill）");
+        }
     }
 }
 
@@ -423,17 +448,42 @@ fn windows_check_process_alive(pid: u32) -> bool {
 
 // ─── Tauri 整合函數 ─────────────────────────────────────────────────
 
-/// 從 `lib.rs::setup()` 呼叫：建立守護程序、啟動 sidecar、存入 managed state
-pub async fn start_proxy_daemon(app: &AppHandle) -> Result<Arc<ProxyDaemon>, String> {
-    let daemon = ProxyDaemon::new(app.clone(), ProxyDaemonConfig::default());
+/// 從 `lib.rs::setup()` 呼叫：建立守護程序並啟動 sidecar。
+///
+/// `child_cell` 必須是已在 `setup()` 中 `manage()` 的同一個容器，
+/// 這樣退出處理才能透過 `tauri::State<ChildCell>` 找到子進程。
+pub async fn start_proxy_daemon(
+    app: &AppHandle,
+    child_cell: ChildCell,
+) -> Result<Arc<ProxyDaemon>, String> {
+    let daemon = ProxyDaemon::new(app.clone(), ProxyDaemonConfig::default(), child_cell);
     daemon.start().await?;
     Ok(daemon)
 }
 
-/// 從 `RunEvent::ExitRequested` 呼叫：優雅關閉 sidecar
-pub async fn shutdown_proxy_daemon(app: &AppHandle) {
+/// **同步** kill 所有 sidecar 子進程——供 `RunEvent::ExitRequested` / `Exit` 呼叫。
+///
+/// 從 `tauri::State` 取出共享 cell，直接 kill 當前子進程。
+/// 此函數不依賴 tokio runtime，可在主執行緒退出階段安全呼叫。
+pub fn kill_sidecar_sync(app: &AppHandle) {
     use tauri::Manager;
-    if let Some(daemon) = app.try_state::<Arc<ProxyDaemon>>() {
-        daemon.inner().shutdown().await;
+    if let Some(cell) = app.try_state::<ChildCell>() {
+        let child = {
+            let mut guard = cell.inner().lock().expect("child_cell poisoned");
+            guard.take()
+        };
+        if let Some(child) = child {
+            match child.kill() {
+                Ok(()) => log::info!("Proxy 進程已終止 (exit handler)"),
+                Err(e) => log::warn!("exit handler kill Proxy 進程失敗: {e}"),
+            }
+        }
+    } else {
+        // cell 尚未 manage（極早期退出）——嘗試從 daemon 取得
+        if let Some(daemon) = app.try_state::<Arc<ProxyDaemon>>() {
+            daemon.inner().kill_child_sync();
+        } else {
+            log::warn!("找不到 Proxy 子進程狀態，可能從未啟動");
+        }
     }
 }

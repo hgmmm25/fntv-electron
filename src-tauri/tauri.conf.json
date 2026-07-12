@@ -1,5 +1,5 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/tauri/tauri_conf_schema.json",
+  "$schema": "https://schema.tauri.app/config/2",
   "productName": "飞牛影视",
   "version": "2.6.1",
   "identifier": "com.qiaokes.fntv",
