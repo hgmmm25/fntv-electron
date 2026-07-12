@@ -1,11 +1,6 @@
 // src-tauri/inject/plugins/titlebar.ts
 // 自定義標題列插件（移植自 src/preload/plugins/titlebar.ts）
 //
-// 變更：
-// - ipcRenderer.send('window-minimize/maximize/close')
-//   → Tauri plugin:window commands（透過 bridge.send）
-// - 移除 Electron 特有 import
-//
 // 重要：視窗控制的 click 改為「事件代理」綁在 document（捕獲階段），
 // 並在 OnDomChange 時重新注入標題列。原因是登入後的首頁為遠端 React SPA，
 // React mount / 重渲染會擾動 document.body，導致原本直接綁在按鈕上的
@@ -17,8 +12,6 @@ import logger from '../logger';
 import { windowMinimize, windowMaximize, windowClose, isTauri, _debugIsBlocked as isBlockedDebug } from '../bridge';
 
 // ── DEBUG：模組載入標記 ────────────────────────────────────
-// 這行在 init script 執行時就會印出。若首頁 console 看不到這行，
-// 代表注入腳本根本沒有在首頁執行（initialization_script 未注入遠端頁）。
 console.log('%c[titlebar] MODULE LOADED', 'color:#0a0;font-weight:bold',
     '| url:', location.href,
     '| readyState:', document.readyState,
@@ -142,59 +135,95 @@ function bindWindowControlDelegation(): void {
     console.log('[titlebar] 綁定視窗控制事件代理, isTauri():', isTauri());
 
     document.addEventListener(
-        'mousedown',
-        (e: MouseEvent) => {
-            // DEBUG：在捕獲階段記錄任何落在標題列按鈕上的 mousedown
-            const ids = ['min-btn', 'max-btn', 'close-btn'];
-            for (const id of ids) {
-                if (getTitlebarButton(e.target, id)) {
-                    console.log(`[titlebar] mousedown 捕獲到 #${id}`);
-                    break;
-                }
-            }
-        },
-        true,
-    );
-
-    document.addEventListener(
         'click',
         (e: MouseEvent) => {
             const minBtn = getTitlebarButton(e.target, 'min-btn');
             const maxBtn = getTitlebarButton(e.target, 'max-btn');
             const closeBtn = getTitlebarButton(e.target, 'close-btn');
-            console.log('[titlebar] document click 捕獲',
-                '| target:', (e.target as Element | null)?.tagName,
-                '| min:', !!minBtn, '| max:', !!maxBtn, '| close:', !!closeBtn);
 
             if (minBtn) {
                 e.preventDefault();
                 e.stopPropagation();
-                console.log('[titlebar] → windowMinimize() (blocked?' + isBlockedDebug('window_minimize') + ')');
                 windowMinimize();
             } else if (maxBtn) {
                 e.preventDefault();
                 e.stopPropagation();
-                console.log('[titlebar] → windowMaximize()');
                 windowMaximize();
             } else if (closeBtn) {
                 e.preventDefault();
                 e.stopPropagation();
-                console.log('[titlebar] → windowClose()');
                 windowClose();
             }
         },
-        true, // 捕獲階段：在網頁任何 handler 之前處理
+        true,
     );
 }
 
-// 模組載入時立即綁定事件代理（initialization_script 於 document_start 執行，
-// document 已可用）。每個頁面導航只執行一次，故無需 hook。
+
+// ══════════════════════════════════════════════════════════════════
+// F11 / Esc 全螢幕快捷鍵
+// ══════════════════════════════════════════════════════════════════
+
+let shortcutsInitialized = false;
+
+function initFullscreenShortcuts(): void {
+    if (shortcutsInitialized) return;
+    shortcutsInitialized = true;
+
+    document.addEventListener('keydown', async (e: KeyboardEvent) => {
+        if (!isTauri()) return;
+
+        // F11 — 切換全螢幕
+        if (e.key === 'F11') {
+            e.preventDefault();
+            e.stopPropagation();
+            try {
+                // @ts-expect-error __TAURI__.window is injected by withGlobalTauri
+                const win = window.__TAURI__?.window?.getCurrentWindow();
+                if (!win) return;
+                const isFS = await win.isFullscreen();
+                if (isFS) {
+                    await win.setFullscreen(false);
+                } else {
+                    await win.setFullscreen(true);
+                }
+            } catch (err) {
+                logger.error('[titlebar] F11 切換全螢幕失敗:', err);
+            }
+            return;
+        }
+
+        // Esc — 退出全螢幕
+        if (e.key === 'Escape') {
+            try {
+                // @ts-expect-error __TAURI__.window is injected by withGlobalTauri
+                const win = window.__TAURI__?.window?.getCurrentWindow();
+                if (!win) return;
+                const isFS = await win.isFullscreen();
+                if (isFS) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    await win.setFullscreen(false);
+                }
+            } catch (err) {
+                logger.error('[titlebar] Esc 退出全螢幕失敗:', err);
+            }
+        }
+    }, true);
+}
+
+
+// ══════════════════════════════════════════════════════════════════
+// 模組載入 & Hook 註冊
+// ══════════════════════════════════════════════════════════════════
+
 bindWindowControlDelegation();
 
-// ─── 註冊 Hook ─────────────────────────────────────────────────────
-//
-// OnReady：首次建立標題列
-// OnDomChange：遠端 SPA 若把標題列移除，下次 DOM 變動時自動重新注入
-//              （既有的 getElementById 守衛會擋住重複建立）
+if (isTauri()) {
+    try { initFullscreenShortcuts(); } catch (e) {
+        console.error('[titlebar] initFullscreenShortcuts 失敗:', e);
+    }
+}
+
 registerHook(HookType.OnReady, injectTitleBar);
 registerHook(HookType.OnDomChange, injectTitleBar);

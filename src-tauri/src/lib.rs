@@ -26,6 +26,7 @@ mod mpv;
 mod proxy_daemon;
 mod tray;
 mod winctrl;
+mod snap_layout;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -150,12 +151,20 @@ pub fn run() {
                 .inner_size(1200.0, 800.0)
                 .min_inner_size(800.0, 600.0)
                 .resizable(true)
-                .decorations(true)
+                .decorations(false)
+                .maximized(true)
                 .initialization_script(&init_script)
                 .build()
                 .expect("建立主視窗失敗");
 
             log::info!("主視窗已建立（含 initialization_script）");
+
+            // ── Windows 11 Snap Layouts 支援 ──────────────────
+            //
+            // 無邊框模式下，透過 WM_NCHITTEST 攔截讓自訂最大化按鈕
+            // 能觸發 Windows 11 的 Snap Layouts 懸停選單。
+            // 僅在 Windows 平台生效，其他平台為 no-op。
+            snap_layout::setup(app);
 
             Ok(())
         })
