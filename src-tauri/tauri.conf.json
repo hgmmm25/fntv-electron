@@ -6,7 +6,7 @@
   "build": {
     "frontendDist": "../resource/login",
     "devUrl": "http://localhost:3000",
-    "beforeDevCommand": "npm run build:inject && npm run build:proxy:tauri:win",
+    "beforeDevCommand": "npm run dev:server & npm run build:inject && npm run build:proxy:tauri:win",
     "beforeBuildCommand": "npm run build:inject && npm run build:proxy:tauri:win"
   },
   "app": {
