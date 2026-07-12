@@ -14,3 +14,9 @@ play_video.py
 *.exe
 .idea
 .vscode
+
+# Tauri
+src-tauri/target/
+src-tauri/binaries/proxy-*
+# 由 scripts/build-inject.mjs 打包產生的注入腳本（勿提交，由建構產生）
+src-tauri/inject/preload.iife.js
