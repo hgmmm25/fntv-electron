@@ -4,7 +4,7 @@
   "description": "默認能力配置 — 啟用 sidecar、視窗控制與基本 shell 能力",
   "windows": ["main"],
   "remote": {
-    "urls": ["http://*/*", "https://*/*"]
+    "urls": ["http://*/*", "https://*/*", "http://*:*/*", "https://*:*/*"]
   },
   "permissions": [
     "core:default",

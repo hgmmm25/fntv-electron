@@ -75,26 +75,30 @@ function isCarouselArrow(target: EventTarget): { el: HTMLDivElement; direction: 
         return null;
     }
 
-    // 判断箭头方向：通过 SVG path 的大致形状
-    const path = svg.querySelector('path');
-    if (!path) return null;
-    const d = path.getAttribute('d') || '';
-
-    // 右箭头：path 中 x 坐标递增的趋势（包含 L + 较大 x 值）
-    // 左箭头：path 中 x 坐标递减的趋势
-    // 简单判断：看 path 后半段的 x 值是否大于前半段
-    const numbers = d.match(/[\d.]+/g);
-    if (!numbers || numbers.length < 4) return null;
-
-    const mid = Math.floor(numbers.length / 2);
-    const firstHalfX = numbers.slice(0, mid).reduce((s, n) => s + parseFloat(n), 0) / mid;
-    const secondHalfX = numbers.slice(mid).reduce((s, n) => s + parseFloat(n), 0) / (numbers.length - mid);
-
-    const direction = secondHalfX > firstHalfX ? 'right' : 'left';
-
-    // 最后验证：这个按钮附近确实有可滚动容器（避免误伤其他圆形按钮）
+    // 最后验证：这个按钮附近确实有可横向滚动容器（避免误伤其他圆形按钮）
     const container = findScrollableContainer(arrowEl);
     if (!container) return null;
+
+    // ── 位置校验：排除容器内部的底部按钮 ──────────────────────
+    //
+    // 真正的轮播箭头满足：
+    // 1. 不是滚动容器的后代（是容器的兄弟或覆盖层）
+    // 2. 水平中心在容器左/右边缘 80px 以内
+    //
+    // 底部导航按钮（播放/详情/收藏等）是容器的后代，会被过滤掉。
+    const containerRect = container.getBoundingClientRect();
+    const btnCenterX = rect.left + rect.width / 2;
+    const EDGE_THRESHOLD = 80;
+
+    const isDescendant = container.contains(arrowEl);
+    if (isDescendant) return null;
+
+    const nearLeftEdge = Math.abs(btnCenterX - containerRect.left) < EDGE_THRESHOLD;
+    const nearRightEdge = Math.abs(btnCenterX - containerRect.right) < EDGE_THRESHOLD;
+    if (!nearLeftEdge && !nearRightEdge) return null;
+
+    // 位置即方向：左边 → 左翻，右边 → 右翻
+    const direction: 'left' | 'right' = nearLeftEdge ? 'left' : 'right';
 
     return { el: arrowEl, direction };
 }

@@ -50,8 +50,16 @@ declare global {
 
 /** 檢查 Tauri 官方 API 是否可用 */
 export function isTauri(): boolean {
-    return typeof window !== 'undefined'
+    const available = typeof window !== 'undefined'
         && typeof window.__TAURI__?.core?.invoke === 'function';
+    if (!available) {
+        console.warn('[bridge] isTauri() = false',
+            '| __TAURI__:', typeof window.__TAURI__,
+            '| core:', typeof window.__TAURI__?.core,
+            '| invoke:', typeof window.__TAURI__?.core?.invoke,
+        );
+    }
+    return available;
 }
 
 // ─── invoke 可用性快取 ──────────────────────────────────────
@@ -84,6 +92,11 @@ export async function send(command: string, data?: unknown): Promise<void> {
     }
 }
 
+/** （DEBUG）檢查某個 command 是否已被標記為封鎖 */
+export function _debugIsBlocked(command: string): boolean {
+    return blockedCommands.has(command);
+}
+
 /**
  * request-reply（替代 ipcRenderer.invoke）
  *
@@ -114,20 +127,45 @@ export function playMovie(data: { id: string; token: string; sourceIndex: number
 }
 
 /**
- * 視窗控制（替代 ipcRenderer.send('window-minimize' / 'window-maximize' / 'window-close')）
+ * 視窗控制：直接呼叫 Tauri core window plugin（ACL 已授權）。
  *
- * 基於安全考量，不直接讓遠端網頁呼叫 Tauri 的 window plugin，
- * 而是走自訂的 Rust command（window_minimize / window_toggle_maximize / window_close），
- * 由 Rust 端統一操作視窗。這樣遠端頁面只能透過我們定義的窄介面控制視窗。
+ * 不再走自訂 Rust command（window_minimize 等），因為自訂 command
+ * 缺少 ACL 權限會被 Tauri 拒絕並加入 blockedCommands 黑名單，
+ * 導致所有後續呼叫靜默失敗（login 頁面也是無效的，只是不易察覺）。
+ *
+ * 直接使用 core window API（minimize / toggleMaximize / close），
+ * 對應的權限 core:window:allow-minimize / allow-toggle-maximize / allow-close
+ * 已在 capabilities/default.json 中授權。
  */
-export function windowMinimize(): Promise<void> {
-    return send('window_minimize');
+export async function windowMinimize(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+        // @ts-expect-error __TAURI__.window is injected by withGlobalTauri
+        const win = window.__TAURI__!.window!.getCurrentWindow();
+        await win.minimize();
+    } catch (e) {
+        console.error('[bridge] windowMinimize failed:', e);
+    }
 }
-export function windowMaximize(): Promise<void> {
-    return send('window_toggle_maximize');
+export async function windowMaximize(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+        // @ts-expect-error __TAURI__.window is injected by withGlobalTauri
+        const win = window.__TAURI__!.window!.getCurrentWindow();
+        await win.toggleMaximize();
+    } catch (e) {
+        console.error('[bridge] windowMaximize failed:', e);
+    }
 }
-export function windowClose(): Promise<void> {
-    return send('window_close');
+export async function windowClose(): Promise<void> {
+    if (!isTauri()) return;
+    try {
+        // @ts-expect-error __TAURI__.window is injected by withGlobalTauri
+        const win = window.__TAURI__!.window!.getCurrentWindow();
+        await win.close();
+    } catch (e) {
+        console.error('[bridge] windowClose failed:', e);
+    }
 }
 
 /**

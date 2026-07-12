@@ -5,17 +5,61 @@
 // - ipcRenderer.send('window-minimize/maximize/close')
 //   → Tauri plugin:window commands（透過 bridge.send）
 // - 移除 Electron 特有 import
+//
+// 重要：視窗控制的 click 改為「事件代理」綁在 document（捕獲階段），
+// 並在 OnDomChange 時重新注入標題列。原因是登入後的首頁為遠端 React SPA，
+// React mount / 重渲染會擾動 document.body，導致原本直接綁在按鈕上的
+// click listener 失效（按鈕可見但點擊無反應）。事件代理綁在 document 上，
+// 不受按鈕節點被重建/搬移影響，可永久生效。
 
 import { registerHook, HookType } from '../hooks';
 import logger from '../logger';
-import { windowMinimize, windowMaximize, windowClose } from '../bridge';
+import { windowMinimize, windowMaximize, windowClose, isTauri, _debugIsBlocked as isBlockedDebug } from '../bridge';
+
+// ── DEBUG：模組載入標記 ────────────────────────────────────
+// 這行在 init script 執行時就會印出。若首頁 console 看不到這行，
+// 代表注入腳本根本沒有在首頁執行（initialization_script 未注入遠端頁）。
+console.log('%c[titlebar] MODULE LOADED', 'color:#0a0;font-weight:bold',
+    '| url:', location.href,
+    '| readyState:', document.readyState,
+    '| __TAURI__:', typeof window.__TAURI__,
+    '| invoke:', typeof window.__TAURI__?.core?.invoke);
+
+const TITLEBAR_ID = 'custom-titlebar';
+
+/** 按鈕 hover 效果對應的內部形狀選擇器 */
+const HOVER_SHAPES: Record<string, { selector: string; isClose: boolean }> = {
+    'min-btn': { selector: 'path, rect', isClose: false },
+    'max-btn': { selector: 'path, rect', isClose: false },
+    'close-btn': { selector: 'path', isClose: true },
+};
+
+/**
+ * 判斷點擊目標是否為自訂標題列內的指定按鈕。
+ *
+ * 用 closest 向上查找，相容點擊落在 SVG / path / rect 上的情況；
+ * 並要求按鈕位於 #custom-titlebar 內，避免與遠端頁面其他同 id 元素衝突。
+ */
+function getTitlebarButton(target: EventTarget | null, id: string): HTMLButtonElement | null {
+    if (!(target instanceof Element)) return null;
+    const btn = target.closest(`#${id}`) as HTMLButtonElement | null;
+    if (btn && btn.closest(`#${TITLEBAR_ID}`)) return btn;
+    return null;
+}
 
 function injectTitleBar(): void {
-    logger.info('Injecting custom title bar...');
-    if (document.getElementById('custom-titlebar')) return;
+    console.log('[titlebar] injectTitleBar() called, url:', location.href);
+    if (document.getElementById(TITLEBAR_ID)) {
+        console.log('[titlebar] already exists, skip');
+        return;
+    }
+    if (!document.body) {
+        console.warn('[titlebar] document.body 不存在，跳過標題列注入');
+        return;
+    }
 
     const bar = document.createElement('div');
-    bar.id = 'custom-titlebar';
+    bar.id = TITLEBAR_ID;
     bar.setAttribute('data-tauri-drag-region', '');
     bar.style.cssText = `
         height:32px;width:100vw;background:rgba(255,255,255,0)!important;
@@ -27,7 +71,7 @@ function injectTitleBar(): void {
 
     bar.innerHTML = `
         <div id="titlebar-btns" style="-webkit-app-region:no-drag;display:flex;gap:2px;padding-right:4px;">
-            <button id="min-btn" style="
+            <button id="min-btn" type="button" style="
                 background:transparent;border:none;width:34px;height:32px;
                 display:flex;align-items:center;justify-content:center;
                 cursor:pointer;border-radius:4px;transition:all 0.2s ease;
@@ -36,7 +80,7 @@ function injectTitleBar(): void {
                     <path d="M2 8H14" stroke="#888" stroke-width="1.5" stroke-linecap="round"/>
                 </svg>
             </button>
-            <button id="max-btn" style="
+            <button id="max-btn" type="button" style="
                 background:transparent;border:none;width:34px;height:32px;
                 display:flex;align-items:center;justify-content:center;
                 cursor:pointer;border-radius:4px;transition:all 0.2s ease;
@@ -45,7 +89,7 @@ function injectTitleBar(): void {
                     <rect x="3" y="3" width="10" height="10" rx="1.5" stroke="#888" stroke-width="1.5"/>
                 </svg>
             </button>
-            <button id="close-btn" style="
+            <button id="close-btn" type="button" style="
                 background:transparent;border:none;width:34px;height:32px;
                 display:flex;align-items:center;justify-content:center;
                 cursor:pointer;border-radius:4px;transition:all 0.2s ease;
@@ -61,44 +105,96 @@ function injectTitleBar(): void {
     document.documentElement.style.overflowY = 'hidden';
     document.body.appendChild(bar);
 
-    // 按鈕互動效果
-    const buttonIds: Array<{ id: string; selector: string }> = [
-        { id: 'min-btn', selector: 'path, rect' },
-        { id: 'max-btn', selector: 'path, rect' },
-        { id: 'close-btn', selector: 'path' },
-    ];
+    bindHoverEffects();
+}
 
-    for (const { id, selector } of buttonIds) {
-        const btn = document.getElementById(id) as HTMLButtonElement;
+/** 按鈕互動效果（直接綁定；每次（重新）注入時呼叫一次） */
+function bindHoverEffects(): void {
+    for (const id of Object.keys(HOVER_SHAPES)) {
+        const btn = document.getElementById(id) as HTMLButtonElement | null;
         if (!btn) continue;
+        const { selector, isClose } = HOVER_SHAPES[id];
 
         btn.addEventListener('mouseenter', () => {
-            if (id === 'close-btn') {
-                btn.style.background = 'rgba(232, 17, 35, 0.2)';
-            } else {
-                btn.style.background = 'rgba(0, 0, 0, 0.06)';
-            }
-            const path = btn.querySelector(selector) as SVGElement;
-            if (path) path.style.stroke = '#fff';
+            btn.style.background = isClose ? 'rgba(232, 17, 35, 0.2)' : 'rgba(0, 0, 0, 0.06)';
+            const shape = btn.querySelector(selector) as SVGElement | null;
+            if (shape) shape.style.stroke = '#fff';
         });
 
         btn.addEventListener('mouseleave', () => {
             btn.style.background = 'transparent';
-            const path = btn.querySelector(selector) as SVGElement;
-            if (path) path.style.stroke = '#888';
+            const shape = btn.querySelector(selector) as SVGElement | null;
+            if (shape) shape.style.stroke = '#888';
         });
     }
-
-    // 視窗控制
-    const minBtn = document.getElementById('min-btn');
-    const maxBtn = document.getElementById('max-btn');
-    const closeBtn = document.getElementById('close-btn');
-
-    if (minBtn) minBtn.addEventListener('click', () => windowMinimize());
-    if (maxBtn) maxBtn.addEventListener('click', () => windowMaximize());
-    if (closeBtn) closeBtn.addEventListener('click', () => windowClose());
 }
 
-// ─── 註冊 Hook ─────────────────────────────────────────────────────
+/**
+ * 視窗控制：以事件代理綁在 document 的捕獲階段。
+ *
+ * 監聽器掛在 document 而非按鈕節點上，即使遠端 SPA（React）重渲染、
+ * 搬移或重建標題列按鈕，點擊仍能正確觸發視窗控制。
+ */
+let delegationBound = false;
+function bindWindowControlDelegation(): void {
+    if (delegationBound) return;
+    delegationBound = true;
+    console.log('[titlebar] 綁定視窗控制事件代理, isTauri():', isTauri());
 
+    document.addEventListener(
+        'mousedown',
+        (e: MouseEvent) => {
+            // DEBUG：在捕獲階段記錄任何落在標題列按鈕上的 mousedown
+            const ids = ['min-btn', 'max-btn', 'close-btn'];
+            for (const id of ids) {
+                if (getTitlebarButton(e.target, id)) {
+                    console.log(`[titlebar] mousedown 捕獲到 #${id}`);
+                    break;
+                }
+            }
+        },
+        true,
+    );
+
+    document.addEventListener(
+        'click',
+        (e: MouseEvent) => {
+            const minBtn = getTitlebarButton(e.target, 'min-btn');
+            const maxBtn = getTitlebarButton(e.target, 'max-btn');
+            const closeBtn = getTitlebarButton(e.target, 'close-btn');
+            console.log('[titlebar] document click 捕獲',
+                '| target:', (e.target as Element | null)?.tagName,
+                '| min:', !!minBtn, '| max:', !!maxBtn, '| close:', !!closeBtn);
+
+            if (minBtn) {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('[titlebar] → windowMinimize() (blocked?' + isBlockedDebug('window_minimize') + ')');
+                windowMinimize();
+            } else if (maxBtn) {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('[titlebar] → windowMaximize()');
+                windowMaximize();
+            } else if (closeBtn) {
+                e.preventDefault();
+                e.stopPropagation();
+                console.log('[titlebar] → windowClose()');
+                windowClose();
+            }
+        },
+        true, // 捕獲階段：在網頁任何 handler 之前處理
+    );
+}
+
+// 模組載入時立即綁定事件代理（initialization_script 於 document_start 執行，
+// document 已可用）。每個頁面導航只執行一次，故無需 hook。
+bindWindowControlDelegation();
+
+// ─── 註冊 Hook ─────────────────────────────────────────────────────
+//
+// OnReady：首次建立標題列
+// OnDomChange：遠端 SPA 若把標題列移除，下次 DOM 變動時自動重新注入
+//              （既有的 getElementById 守衛會擋住重複建立）
 registerHook(HookType.OnReady, injectTitleBar);
+registerHook(HookType.OnDomChange, injectTitleBar);
