@@ -50,48 +50,6 @@
             height: auto;
         }
 
-        .logo-info {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 15px;
-            margin-top: 15px;
-            flex-wrap: wrap;
-        }
-
-        .code-by {
-            font-size: 12px;
-            color: rgba(255, 255, 255, 0.6);
-            font-style: italic;
-            white-space: nowrap;
-        }
-
-        .github-link {
-            font-size: 12px;
-            color: rgba(255, 255, 255, 0.7);
-            text-decoration: none;
-            padding: 4px 8px;
-            border-radius: 4px;
-            transition: all 0.2s ease;
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            white-space: nowrap;
-        }
-
-        .github-link:hover {
-            color: #fff;
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.3);
-            text-decoration: none;
-        }
-
-        /* 在小屏幕上垂直排列 */
-        @media (max-width: 400px) {
-            .logo-info {
-                flex-direction: column;
-                gap: 8px;
-            }
-        }
-
         .form-group {
             margin-bottom: 20px;
             position: relative;
@@ -201,47 +159,6 @@
 
         .login-btn.enabled:hover {
             background-color: #2856c4;
-        }
-
-        /* 版本信息样式 */
-        .version-info {
-            margin-top: 20px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px 0;
-            border-top: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .version-text {
-            font-size: 12px;
-            color: rgba(255, 255, 255, 0.7);
-        }
-
-        .update-btn {
-            padding: 6px 12px;
-            background-color: rgba(255, 255, 255, 0.1);
-            color: rgba(255, 255, 255, 0.8);
-            border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 4px;
-            font-size: 12px;
-            cursor: pointer;
-            transition: all 0.2s;
-        }
-
-        .update-btn:hover {
-            background-color: rgba(255, 255, 255, 0.2);
-            color: white;
-            border-color: rgba(255, 255, 255, 0.3);
-        }
-
-        .update-btn:active {
-            transform: translateY(1px);
-        }
-
-        .update-btn.checking {
-            cursor: not-allowed;
-            opacity: 0.6;
         }
 
         /* 代理设置按钮样式 */
@@ -890,10 +807,6 @@
         <div class="logo">
             <!-- 修改 logo 图标为 base64 -->
             <img src="./image/logo.png" alt="飞牛影视" />
-            <div class="logo-info">
-                <span class="code-by">code by Tag mig hånden</span>
-                <a href="https://github.com/QiaoKes/fntv-electron" class="github-link" target="_blank" rel="noopener noreferrer">github地址</a>
-            </div>
         </div>
         <div class="form-group has-button">
             <label for="domain">域名/IP地址/FN ID</label>
@@ -922,11 +835,6 @@
         </div>
         <button class="login-btn" id="loginBtn" disabled>登录</button>
         
-        <!-- 版本信息和更新检查 -->
-        <div class="version-info">
-            <div class="version-text" id="versionText">版本 1.6.4</div>
-            <button class="update-btn" id="updateBtn" title="检查更新">检查更新</button>
-        </div>
     </div>
 
     <!-- 代理设置按钮（右上角） -->
@@ -1079,9 +987,6 @@
                         await tauriInvokeDirect('set_hide_original_play_button', { hide: data.hideOriginalPlayButton });
                         onPlayButtonConfigSet({ success: true });
                         break;
-                    case 'get-version':
-                        onVersionInfo({ version: 'Tauri' });
-                        break;
                     default:
                         console.warn('[login] 未知的 Tauri 命令:', command);
                 }
@@ -1156,12 +1061,6 @@
             }
         }
 
-        function onVersionInfo(data) {
-            if (data && data.version) {
-                versionText.textContent = `版本 ${data.version}`;
-            }
-        }
-
         // ── Electron 事件監聽（僅在 Electron 環境下啟用）──────
         if (!isTauri && ipcRenderer) {
             ipcRenderer.on('config-data', (event, data) => onConfigData(data));
@@ -1172,7 +1071,6 @@
             ipcRenderer.on('play-button-config-info', (event, data) => onPlayButtonConfigInfo(data));
             ipcRenderer.on('download-proxy-set', (event, data) => onDownloadProxySet(data));
             ipcRenderer.on('play-button-config-set', (event, data) => onPlayButtonConfigSet(data));
-            ipcRenderer.on('version-info', (event, data) => onVersionInfo(data));
         }
         
         const loginBtn = document.getElementById('loginBtn');
@@ -1192,8 +1090,6 @@
         const messageTitle = document.getElementById('messageTitle');
         const messageContent = document.getElementById('messageContent');
         const messageButton = document.getElementById('messageButton');
-        const versionText = document.getElementById('versionText');
-        const updateBtn = document.getElementById('updateBtn');
         const proxySettingsBtn = document.getElementById('proxySettingsBtn');
         const proxyPanel = document.getElementById('proxyPanel');
         const proxyCloseBtn = document.getElementById('proxyCloseBtn');
@@ -1595,21 +1491,6 @@
             setTimeout(restoreFocus, 100);
         });
 
-        // GitHub链接点击事件处理
-        document.addEventListener('click', function(e) {
-            if (e.target.classList.contains('github-link')) {
-                e.preventDefault(); // 阻止默认行为
-                const url = e.target.href;
-                // Tauri: 使用 window.open；Electron: 使用 shell.openExternal
-                if (isTauri) {
-                    window.open(url, '_blank');
-                } else {
-                    const { shell } = require('electron');
-                    shell.openExternal(url);
-                }
-            }
-        });
-
         // 禁止拖拽事件
         document.addEventListener('dragstart', function(e) {
             e.preventDefault();
@@ -1627,35 +1508,6 @@
             e.preventDefault();
             return false;
         });
-
-        // 更新检查相关函数
-        function initVersionInfo() {
-            // 获取版本信息
-            ipcSend('get-version');
-        }
-
-        function handleUpdateCheck() {
-            const btn = updateBtn;
-            const originalText = btn.textContent;
-            
-            // 设置检查中状态
-            btn.textContent = '检查中...';
-            btn.classList.add('checking');
-            btn.disabled = true;
-            
-            // 发送检查更新请求
-            ipcSend('check-update');
-            
-            // 5秒后恢复按钮状态（防止无响应）
-            setTimeout(() => {
-                btn.textContent = originalText;
-                btn.classList.remove('checking');
-                btn.disabled = false;
-            }, 5000);
-        }
-
-        // 更新按钮点击事件
-        updateBtn.addEventListener('click', handleUpdateCheck);
 
         // 代理设置相关函数
         function initProxySettings() {
@@ -1717,7 +1569,6 @@
         // 页面加载完成后读取配置
         window.addEventListener('DOMContentLoaded', function () {
             loadConfigData();
-            initVersionInfo(); // 初始化版本信息
             initProxySettings(); // 初始化代理设置
             
             // 确保页面加载后域名输入框能够正确获取焦点
