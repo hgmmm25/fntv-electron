@@ -40,11 +40,15 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_shell::process::{CommandChild, CommandEvent, TerminatedPayload};
 use tauri_plugin_shell::ShellExt;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::interval;
+
+/// Go proxy 認證密鑰檔案名（對應 Electron `userDataDir/proxy-secret`）。
+/// 由 Rust 側生成/持久化，透過 stdin 注入 Go sidecar。
+const PROXY_SECRET_FILE: &str = "proxy-secret";
 
 // ─── 共享子進程句柄 ─────────────────────────────────────────────────
 
@@ -101,6 +105,130 @@ fn verify_port_listening(port: u16, timeout: Duration) -> bool {
         }
     }
     false
+}
+
+// ─── 代理認證密鑰 ─────────────────────────────────────────────────
+
+/// 產生 64 hex（32 bytes）隨機密鑰，對應 Electron `randomBytes(32).toString('hex')`。
+#[cfg(windows)]
+fn generate_random_secret() -> Result<String, String> {
+    use windows_sys::Win32::Security::Cryptography::BCryptGenRandom;
+    const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x2;
+    let mut buf = [0u8; 32];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status != 0 {
+        return Err(format!("BCryptGenRandom 失敗 (NTSTATUS=0x{status:x})"));
+    }
+    Ok(hex::encode(buf))
+}
+
+/// 非 Windows 後備（讀 /dev/urandom）
+#[cfg(not(windows))]
+fn generate_random_secret() -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    let mut f = std::fs::File::open("/dev/urandom")
+        .map_err(|e| format!("無法開啟 /dev/urandom: {e}"))?;
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("讀取 /dev/urandom 失敗: {e}"))?;
+    Ok(hex::encode(buf))
+}
+
+/// 讀取既有密鑰（僅接受 64 hex，防止格式錯誤的殘留檔案導致啟動失敗）
+fn read_existing_secret(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let trimmed = content.trim().to_string();
+    let is_valid = trimmed.len() == 64
+        && trimmed
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+    if is_valid {
+        Some(trimmed)
+    } else {
+        log::warn!("proxy-secret 檔案格式無效，重新生成");
+        None
+    }
+}
+
+/// 在指定目錄下載入或建立 proxy-secret，回傳密鑰字串。
+fn load_or_create_secret_in_dir(data_dir: &std::path::Path) -> Result<String, String> {
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("無法建立 app_data_dir: {e}"))?;
+
+    let secret_path = data_dir.join(PROXY_SECRET_FILE);
+    if let Some(existing) = read_existing_secret(&secret_path) {
+        return Ok(existing);
+    }
+
+    let secret = generate_random_secret()?;
+
+    // 原子寫入：先寫臨時檔再 rename，避免半寫狀態
+    let tmp_path = data_dir.join(format!("{PROXY_SECRET_FILE}.tmp"));
+    std::fs::write(&tmp_path, format!("{secret}\n"))
+        .map_err(|e| format!("寫入 proxy-secret 失敗: {e}"))?;
+    std::fs::rename(&tmp_path, &secret_path)
+        .map_err(|e| format!("取代 proxy-secret 失敗: {e}"))?;
+    log::info!("已建立 proxy-secret: {}", secret_path.display());
+    Ok(secret)
+}
+
+/// 在 app_data_dir 下載入或建立 proxy-secret，回傳密鑰字串。
+fn load_or_create_proxy_secret(app: &AppHandle) -> Result<String, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("無法取得 app_data_dir: {e}"))?;
+    load_or_create_secret_in_dir(&data_dir)
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+
+    #[test]
+    fn generate_secret_is_64_lower_hex() {
+        let secret = generate_random_secret().unwrap();
+        assert_eq!(secret.len(), 64);
+        assert!(secret
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn load_or_create_reuses_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "fntv-proxy-secret-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = load_or_create_secret_in_dir(&dir).unwrap();
+        assert_eq!(first.len(), 64);
+        let second = load_or_create_secret_in_dir(&dir).unwrap();
+        assert_eq!(first, second, "再次載入應複用同一密鑰");
+        let persisted = std::fs::read_to_string(dir.join(PROXY_SECRET_FILE)).unwrap();
+        assert_eq!(persisted.trim(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_existing_file_is_replaced() {
+        let dir = std::env::temp_dir().join(format!(
+            "fntv-proxy-secret-test-invalid-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(PROXY_SECRET_FILE), "not-a-valid-secret").unwrap();
+        let secret = load_or_create_secret_in_dir(&dir).unwrap();
+        assert_eq!(secret.len(), 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 // ─── 配置 ───────────────────────────────────────────────────────────
@@ -202,6 +330,8 @@ pub struct ProxyDaemon {
     app: AppHandle,
     /// Go proxy 實際使用的連接埠（可能與 DEFAULT_PROXY_PORT 不同）
     actual_port: AtomicU16,
+    /// 代理認證密鑰（64 hex，與 Go sidecar 共享，用於 /api/v1/session 鑑權）
+    secret: String,
 }
 
 impl ProxyDaemon {
@@ -210,6 +340,10 @@ impl ProxyDaemon {
     /// `child_cell` 應由 `lib.rs::setup()` 預先建立並 `manage()`，
     /// 確保退出處理隨時能存取子進程句柄。
     pub fn new(app: AppHandle, config: ProxyDaemonConfig, child_cell: ChildCell) -> Arc<Self> {
+        let secret = load_or_create_proxy_secret(&app).unwrap_or_else(|e| {
+            log::error!("初始化 proxy-secret 失敗: {e}");
+            String::new()
+        });
         Arc::new(Self {
             config,
             bookkeeping: Arc::new(AsyncMutex::new(DaemonBookkeeping {
@@ -221,6 +355,7 @@ impl ProxyDaemon {
             child_cell,
             app,
             actual_port: AtomicU16::new(DEFAULT_PROXY_PORT),
+            secret,
         })
     }
 
@@ -232,6 +367,11 @@ impl ProxyDaemon {
     /// 回傳 Go proxy 的基礎 URL
     pub fn base_url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port())
+    }
+
+    /// 回傳代理認證密鑰（供播放流程註冊 proxy session）
+    pub fn secret(&self) -> &str {
+        &self.secret
     }
 
     /// 啟動 sidecar 並開始守護
@@ -276,9 +416,19 @@ impl ProxyDaemon {
             .map_err(|e| format!("建立 sidecar 命令失敗: {e}"))?
             .args(["--port", &port.to_string()]);
 
-        let (rx, child) = sidecar
+        let (rx, mut child) = sidecar
             .spawn()
             .map_err(|e| format!("啟動 sidecar 失敗: {e}"))?;
+
+        // 2.5 透過 stdin 注入認證密鑰（上游協議：Go 啟動時從 stdin 讀一行 secret）
+        let secret = self.secret.clone();
+        if secret.is_empty() {
+            let _ = child.kill();
+            return Err("proxy-secret 為空，無法啟動 Proxy".to_string());
+        }
+        if let Err(e) = child.write(format!("{secret}\n").as_bytes()) {
+            log::warn!("寫入 proxy secret 至 stdin 失敗: {e}");
+        }
 
         // 3. 存入共享 cell（清理舊進程）
         {

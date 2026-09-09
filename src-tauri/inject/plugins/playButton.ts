@@ -11,6 +11,7 @@ import { registerHook, HookType } from '../hooks';
 import logger from '../logger';
 import { getCookie } from '../utils';
 import { playMovie, getPlayButtonConfig } from '../bridge';
+import { extractItemGuidFromUrl } from '../core/playTarget';
 
 // ─── 版本源索引偵測 ───────────────────────────────────────────────
 
@@ -45,8 +46,8 @@ function getCurrentSelectedVersionIndex(): number {
 // ─── 發送播放事件 ─────────────────────────────────────────────────
 
 function sendPlayEventToMain(button: HTMLElement | null = null): string | null {
-    const url = window.location.href;
-    const id = url.split('/').pop();
+    // 从当前详情页/播放页 URL 按新旧路由提取 itemGuid
+    const id = extractItemGuidFromUrl(window.location.href);
 
     if (!id) {
         logger.error('Failed to extract ID from DOM or URL');
@@ -92,30 +93,6 @@ function findReferenceButton(context: Document | Element = document): HTMLButton
     return null;
 }
 
-// ─── 克隆按鈕注入 ─────────────────────────────────────────────────
-
-function clonePlayBtnAndInject(callback: (button: HTMLElement) => void, btnText: string): void {
-    const referenceButton = findReferenceButton();
-    if (!referenceButton || referenceButton.hasAttribute('data-mpv-btn')) return;
-
-    logger.info('Detected inject page, injecting play button...');
-    referenceButton.setAttribute('data-mpv-btn', 'processed');
-
-    const newButton = referenceButton.cloneNode(true) as HTMLButtonElement;
-    newButton.removeAttribute('data-mpv-btn');
-
-    const textSpans = newButton.querySelector('span > span > span') as HTMLSpanElement;
-    if (textSpans) textSpans.textContent = btnText;
-
-    newButton.setAttribute('data-custom-play', 'true');
-    newButton.addEventListener('click', () => callback(referenceButton));
-
-    const parentNode = referenceButton.parentNode;
-    if (parentNode) {
-        parentNode.insertBefore(newButton, referenceButton.nextSibling);
-    }
-}
-
 // ─── 攔截原始按鈕 ─────────────────────────────────────────────────
 
 function interceptOriginalButton(): void {
@@ -144,9 +121,11 @@ async function injectCustomPlayBtn(): Promise<void> {
     const config = await getPlayButtonConfig();
 
     if (config.hideOriginalPlayButton) {
+        // 偏好=MPV 播放：拦截详情页原始播放按钮，点击改走 MPV
         interceptOriginalButton();
     } else {
-        clonePlayBtnAndInject((button) => sendPlayEventToMain(button), 'MPV播放');
+        // 偏好=网页播放：不拦截原始按钮，放行页面原生播放逻辑
+        logger.info('MPV 接管已关闭（网页播放模式），放行原始播放按钮');
     }
 }
 

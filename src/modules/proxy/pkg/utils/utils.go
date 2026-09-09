@@ -17,6 +17,27 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+type rangeRetryTransport struct {
+	base http.RoundTripper
+}
+
+func (t rangeRetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.base.RoundTrip(req)
+	if err != nil || resp.StatusCode != http.StatusRequestedRangeNotSatisfiable || req.Header.Get("Range") != "bytes=0-" {
+		return resp, err
+	}
+
+	if closeErr := resp.Body.Close(); closeErr != nil {
+		logger.Debugf("关闭 416 响应失败: %v", closeErr)
+	}
+	retry := req.Clone(req.Context())
+	retry.Header = req.Header.Clone()
+	retry.Header.Del("Range")
+	retry.Header.Del("If-Range")
+	logger.Warnf("上游拒绝初始开放 Range，请求将在不带 Range 的情况下重试: %s", req.URL.Path)
+	return t.base.RoundTrip(retry)
+}
+
 func JsonPrintBytes(v any) []byte {
 	if v == nil {
 		return []byte("{}")
@@ -118,12 +139,13 @@ func DynamicProxy(c *gin.Context, targetURL string, extraHeaders map[string]stri
 	proxy := httputil.NewSingleHostReverseProxy(&targetNoUser)
 
 	// 设置超时时间
-	proxy.Transport = &http.Transport{
+	baseTransport := &http.Transport{
 		ResponseHeaderTimeout: 120 * time.Second,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: skipVerify,
 		},
 	}
+	proxy.Transport = rangeRetryTransport{base: baseTransport}
 
 	// 修改请求前的处理
 	proxy.Director = func(req *http.Request) {
@@ -146,7 +168,7 @@ func DynamicProxy(c *gin.Context, targetURL string, extraHeaders map[string]stri
 			req.Header.Set(key, value)
 		}
 
-		logger.Infof("method:%s path:%s query:%s, header:%v", req.Method, req.URL.Path, req.URL.RawQuery, req.Header)
+		logger.Infof("代理请求 method=%s host=%s path=%s range=%s", req.Method, req.URL.Host, req.URL.Path, req.Header.Get("Range"))
 
 		// 如果客户端没带 Authorization，但 URL 有 userinfo，就补上 BasicAuth
 		if req.Header.Get("Authorization") == "" && hasUser {
@@ -168,8 +190,7 @@ func DynamicProxy(c *gin.Context, targetURL string, extraHeaders map[string]stri
 
 	// 修改响应后的处理
 	proxy.ModifyResponse = func(resp *http.Response) error {
-		// 打印相应头
-		logger.Infof("响应状态: %s, 头部: %v", resp.Status, resp.Header)
+		logger.Infof("代理响应 status=%s contentLength=%d", resp.Status, resp.ContentLength)
 		// 可以在这里修改响应头部或内容
 		return nil
 	}

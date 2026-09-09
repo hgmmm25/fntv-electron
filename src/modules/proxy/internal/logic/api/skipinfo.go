@@ -7,7 +7,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-func GetSkipInfoHandler(c *gin.Context) {
+func GetSkipInfoHandler(c *gin.Context, sessions *PlaybackSessionStore) {
 	// 解析参数
 	var params GetSkipInfoParams
 	if err := c.ShouldBindUri(&params); err != nil {
@@ -22,13 +22,18 @@ func GetSkipInfoHandler(c *gin.Context) {
 		return
 	}
 
-	if params.Domain == "" || params.Token == "" || params.ItemGuid == "" {
-		logger.Errorf("缺少必要参数: domain=%s, token=%s, itemGuid=%s", params.Domain, params.Token, params.ItemGuid)
+	if params.Session == "" || params.ItemGuid == "" {
+		logger.Errorf("缺少必要参数: sessionPresent=%t, itemGuid=%s", params.Session != "", params.ItemGuid)
 		c.JSON(400, ResponseBase{Code: InternalErrorCode, Msg: "Missing required parameters"})
 		return
 	}
 
-	fnApi := fnapi.NewApiService(params.Domain, params.Token, params.SkipVerify == 1)
+	session, err := sessions.Resolve(params.Session, params.ItemGuid)
+	if err != nil {
+		c.JSON(401, ResponseBase{Code: InternalErrorCode, Msg: "Invalid playback session"})
+		return
+	}
+	fnApi := fnapi.NewApiService(session.Domain, session.Token, session.SkipVerify, session.AccessCookie)
 
 	// 获取跳过片头片尾信息
 	logger.Infof("开始获取跳过片头片尾信息: itemGuid=%s", params.ItemGuid)
@@ -59,7 +64,7 @@ func GetSkipInfoHandler(c *gin.Context) {
 	})
 }
 
-func SetSkipInfoHandler(c *gin.Context) {
+func SetSkipInfoHandler(c *gin.Context, sessions *PlaybackSessionStore) {
 	// 解析参数
 	var req SetSkipInfoReq
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -74,13 +79,18 @@ func SetSkipInfoHandler(c *gin.Context) {
 		return
 	}
 
-	if req.Domain == "" || req.Token == "" || req.Guid == "" {
-		logger.Errorf("缺少必要参数: domain=%s, token=%s, guid=%s", req.Domain, req.Token, req.Guid)
+	if req.Session == "" || req.Guid == "" {
+		logger.Errorf("缺少必要参数: sessionPresent=%t, guid=%s", req.Session != "", req.Guid)
 		c.JSON(400, ResponseBase{Code: InternalErrorCode, Msg: "Missing required parameters"})
 		return
 	}
 
-	fnApi := fnapi.NewApiService(req.Domain, req.Token, req.SkipVerify == 1)
+	session, err := sessions.Resolve(req.Session, req.Guid)
+	if err != nil {
+		c.JSON(401, ResponseBase{Code: InternalErrorCode, Msg: "Invalid playback session"})
+		return
+	}
+	fnApi := fnapi.NewApiService(session.Domain, session.Token, session.SkipVerify, session.AccessCookie)
 
 	// 获取播放信息缓存
 	playInfo, err := fnApi.GetPlayInfoCached(req.Guid)

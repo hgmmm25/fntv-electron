@@ -30,11 +30,7 @@ type ResponseBase struct {
 // PlayVideoParams 播放视频请求参数
 type PlayVideoParams struct {
 	ItemGuid    string `json:"itemGuid" uri:"itemGuid"`
-	Token       string `json:"token" form:"token"`
-	Account     string `json:"account" form:"account"`
-	Domain      string `json:"domain" form:"domain"`
-	SkipVerify  int32  `json:"skipVerify" form:"skipVerify"`
-	UseNasLocal int32  `json:"useNasLocal" form:"useNasLocal"`
+	Session     string `json:"session" form:"session"`
 	SourceIndex int32  `json:"sourceIndex" form:"sourceIndex"`
 }
 
@@ -53,10 +49,8 @@ type SkipInfo struct {
 
 // SkipInfoParams 跳过片头片尾请求参数
 type GetSkipInfoParams struct {
-	ItemGuid   string `json:"itemGuid" uri:"itemGuid"`
-	Token      string `json:"token" form:"token"`
-	Domain     string `json:"domain" form:"domain"`
-	SkipVerify int32  `json:"skipVerify" form:"skipVerify"`
+	ItemGuid string `json:"itemGuid" uri:"itemGuid"`
+	Session  string `json:"session" form:"session"`
 }
 
 type GetSkipInfoResp struct {
@@ -67,8 +61,6 @@ type GetSkipInfoResp struct {
 // SkipInfoReq 跳过片头片尾请求体
 type SetSkipInfoReq struct {
 	SkipInfo
-	Guid       string `json:"guid"`
-	Token      string `json:"token" form:"token"`
-	Domain     string `json:"domain" form:"domain"`
-	SkipVerify int32  `json:"skipVerify" form:"skipVerify"`
+	Guid    string `json:"guid"`
+	Session string `json:"session" form:"session"`
 }
