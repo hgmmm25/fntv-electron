@@ -14,6 +14,8 @@ play_video.py
 *.exe
 .idea
 .vscode
+本地功能移植进度.md
+上游进度对比_2026-09-09.md
 
 # Tauri
 src-tauri/target/
