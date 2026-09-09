@@ -29,13 +29,16 @@ pub struct LoginResult {
 
 /// 登入命令 — 對應 Electron 的 `handleLogin`
 ///
-/// 流程：呼叫 FN API → 儲存設定 → 儲存歷史記錄 → 回傳結果
+/// 流程：若提供訪問碼 → 先向閘道驗證訪問碼（建立閘道會話 Cookie）
+/// → 以解析後的 base URL 呼叫 FN API → 儲存設定（訪問碼加密）→
+/// 儲存歷史記錄 → 回傳結果
 #[tauri::command]
 pub async fn login(
     app: tauri::AppHandle,
     domain: String,
     username: String,
     password: String,
+    access_code: Option<String>,
     use_https: Option<bool>,
 ) -> Result<LoginResult, String> {
     log::info!("收到登入請求: domain={domain}, username={username}");
@@ -51,6 +54,31 @@ pub async fn login(
         "http"
     };
     let server = format!("{}://{}", protocol, domain);
+    let access_code = access_code.unwrap_or_default();
+
+    // 訪問碼驗證（空訪問碼也會清空歷史授權並直接通過）
+    let session = match crate::access_code::verify_access_code(&server, &access_code).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("訪問碼驗證失敗: {e}");
+            return Ok(LoginResult {
+                success: false,
+                domain: None,
+                token: None,
+                message: Some(match e {
+                    crate::access_code::AccessCodeError::Rejected(msg) => {
+                        format!("訪問碼驗證失敗: {msg}")
+                    }
+                    crate::access_code::AccessCodeError::Network(msg) => {
+                        format!("訪問碼驗證失敗: {msg}")
+                    }
+                }),
+            });
+        }
+    };
+
+    // 訪問碼可能把請求重定向到新端口/地址，登入 API 使用解析後的 base URL
+    let server = session.base_url;
 
     // 呼叫登入 API
     let login_data = serde_json::json!({
@@ -83,12 +111,13 @@ pub async fn login(
                 }
             };
 
-            // 儲存設定（domain 使用可能被重定向後的伺服器地址）
+            // 儲存設定（domain 使用可能被重定向後的伺服器地址；訪問碼加密儲存）
             config::save_login_config(
                 app.clone(),
                 username.clone(),
                 server.clone(),
                 token.clone(),
+                Some(access_code.clone()),
                 use_https,
             )?;
 
@@ -98,6 +127,7 @@ pub async fn login(
                 domain,
                 username,
                 password,
+                Some(access_code),
                 use_https,
             )?;
 
@@ -162,7 +192,25 @@ pub async fn restore_cookies(
         same_site = same_site,
     );
 
-    let cookie_js = format!("{}\n{}", token_js, relay_js);
+    let mut cookie_js = format!("{}\n{}", token_js, relay_js);
+
+    // 附加訪問碼閘道會話 Cookie（best effort：僅在目前頁面與 grant origin
+    // 一致時才會生效；主播放鏈路的閘道 Cookie 已由 Proxy session 註冊攜帶）
+    let grant_cookie = crate::access_code::get_access_cookie_header(&domain);
+    if !grant_cookie.is_empty() {
+        for pair in grant_cookie.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            cookie_js.push_str(&format!(
+                "\ndocument.cookie = '{}; path=/; {secure}samesite={same_site}';",
+                escape_js_string(pair),
+                secure = secure,
+                same_site = same_site,
+            ));
+        }
+    }
 
     // 透過主視窗 eval 注入 cookie
     if let Some(window) = app.get_webview_window("main") {

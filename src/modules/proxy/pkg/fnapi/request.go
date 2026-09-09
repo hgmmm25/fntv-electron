@@ -85,6 +85,30 @@ func GenFnAuthx(url string, data interface{}) string {
 
 const DefaultTimeout = 10000 // 默认超时时间（毫秒）
 
+func ComposeCookieHeader(accessCookie string) string {
+	parts := make([]string, 0)
+	seen := make(map[string]struct{})
+	for _, rawPart := range strings.Split(accessCookie, ";") {
+		part := strings.TrimSpace(rawPart)
+		separator := strings.Index(part, "=")
+		if separator <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(part[:separator])
+		normalizedName := strings.ToLower(name)
+		if normalizedName == "mode" {
+			continue
+		}
+		if _, exists := seen[normalizedName]; exists {
+			continue
+		}
+		seen[normalizedName] = struct{}{}
+		parts = append(parts, name+"="+strings.TrimSpace(part[separator+1:]))
+	}
+	parts = append(parts, "mode=relay")
+	return strings.Join(parts, "; ")
+}
+
 // Request 发送API请求
 func Request[T any](client *http.Client, baseURL, url string, method HttpMethod, token string, data interface{}, extraHeaders map[string]string, timeout, tryTimes int) (*ApiResponse[T], error) {
 	if tryTimes <= 0 {
@@ -120,6 +144,7 @@ func Request[T any](client *http.Client, baseURL, url string, method HttpMethod,
 	for k, v := range extraHeaders {
 		headers[k] = v
 	}
+	headers["Cookie"] = ComposeCookieHeader(headers["Cookie"])
 
 	var lastErr error
 	for attempt := 0; attempt <= tryTimes; attempt++ {
@@ -152,14 +177,16 @@ func Request[T any](client *http.Client, baseURL, url string, method HttpMethod,
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		defer resp.Body.Close()
-
 		respBody, err := io.ReadAll(resp.Body)
+		closeErr := resp.Body.Close()
 		if err != nil {
 			logger.Warnf("读取响应体失败 (尝试%d/%d): %v", attempt+1, tryTimes+1, err)
 			lastErr = err
 			time.Sleep(100 * time.Millisecond)
 			continue
+		}
+		if closeErr != nil {
+			logger.Warnf("关闭响应体失败 (尝试%d/%d): %v", attempt+1, tryTimes+1, closeErr)
 		}
 
 		logger.Debugf("收到响应: 状态码=%d, 响应体大小=%d bytes", resp.StatusCode, len(respBody))

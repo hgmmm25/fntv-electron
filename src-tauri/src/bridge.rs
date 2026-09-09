@@ -39,33 +39,81 @@ pub struct PlayButtonConfig {
 // play_movie — 完整播放流程
 // ═══════════════════════════════════════════════════════════════
 
-/// 產生代理 URL（對應 Electron 的 `getProxyUrl`）
+/// 產生代理播放 URL（對應 Electron `createProxyPlaybackUrl`）
 ///
-/// MPV 透過此 URL 向本地 Go proxy 拉流，Go proxy 再向 FN 伺服器取資料。
-fn build_proxy_url(
+/// MPV 透過此 URL 向本地 Go proxy 拉流，Go proxy 依 session
+/// 解析出 token/account/domain 後再向 FN 伺服器取資料。
+fn create_proxy_playback_url(
     proxy_base: &str,
-    cfg: &config::AppConfig,
+    session: &str,
     item_guid: &str,
     source_index: i64,
 ) -> String {
-    let domain = cfg.domain.as_deref().unwrap_or("");
-    let token = cfg.token.as_deref().unwrap_or("");
-    let account = cfg.account.as_deref().unwrap_or("");
-    let skip_verify = "1"; // Tauri 版統一跳過
-    let use_nas_local = if cfg.nas_proxy_enabled.unwrap_or(false) {
-        "1"
-    } else {
-        "0"
-    };
-
-    // 對 domain 做 URL 編碼
-    let encoded_domain =
-        percent_encoding::utf8_percent_encode(domain, percent_encoding::NON_ALPHANUMERIC)
+    let encoded_guid =
+        percent_encoding::utf8_percent_encode(item_guid, percent_encoding::NON_ALPHANUMERIC)
             .to_string();
+    if source_index > 0 {
+        format!(
+            "{proxy_base}/api/v1/playvideo/{encoded_guid}?session={session}&sourceIndex={source_index}"
+        )
+    } else {
+        format!("{proxy_base}/api/v1/playvideo/{encoded_guid}?session={session}")
+    }
+}
 
-    format!(
-        "{proxy_base}/api/v1/playvideo/{item_guid}?token={token}&skipVerify={skip_verify}&account={account}&domain={encoded_domain}&useNasLocal={use_nas_local}&sourceIndex={source_index}"
-    )
+/// 向本地 Go proxy 註冊播放 session（對應 Electron `registerPlaybackSession`）
+async fn register_proxy_session(
+    proxy_base: &str,
+    secret: &str,
+    token: &str,
+    cfg: &config::AppConfig,
+    item_guids: &[String],
+) -> Result<String, String> {
+    let body = serde_json::json!({
+        "token": token,
+        "account": cfg.account.as_deref().unwrap_or(""),
+        "domain": cfg.domain.as_deref().unwrap_or(""),
+        "accessCookie": crate::access_code::get_access_cookie_header(cfg.domain.as_deref().unwrap_or("")),
+        "skipVerify": true, // Tauri 版統一跳過憑證驗證（與原 skipVerify=1 一致）
+        "useNasLocal": cfg.nas_proxy_enabled.unwrap_or(false),
+        "itemGuids": item_guids,
+    });
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{proxy_base}/api/v1/session"))
+        .header("Content-Type", "application/json")
+        .header("X-FNTV-Proxy-Secret", secret)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Proxy 建立播放 session 失敗: {e}"))?;
+
+    if resp.status() != reqwest::StatusCode::CREATED {
+        return Err(format!(
+            "Proxy 建立播放 session 失敗 (HTTP {})",
+            resp.status().as_u16()
+        ));
+    }
+
+    let payload: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Proxy 播放 session 回應解析失敗: {e}"))?;
+    let session = payload
+        .get("session")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    let is_valid = session.len() == 64
+        && session
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+    if !is_valid {
+        return Err("Proxy 回傳了無效的播放 session".to_string());
+    }
+    Ok(session)
 }
 
 /// 從 JSON 值中安全提取字串欄位
@@ -91,12 +139,8 @@ fn json_i64(val: &serde_json::Value, key: &str) -> i64 {
 }
 
 /// 將 FN API 回應的項目轉為 MPV PlayListItem（對應 Electron 的 processEpisodeMedia）
-fn process_episode_media(
-    info: &serde_json::Value,
-    proxy_base: &str,
-    cfg: &config::AppConfig,
-    source_index: i64,
-) -> PlayListItem {
+/// play_link 由呼叫方在註冊 proxy session 後統一填充。
+fn process_episode_media(info: &serde_json::Value) -> PlayListItem {
     let guid = json_str(info, "guid");
     PlayListItem {
         item_guid: guid.clone(),
@@ -106,17 +150,13 @@ fn process_episode_media(
         episode_number: json_i64(info, "episode_number") as u32,
         ts: json_f64(info, "ts"),
         duration: json_f64(info, "duration"),
-        play_link: build_proxy_url(proxy_base, cfg, &guid, source_index),
+        play_link: String::new(),
     }
 }
 
 /// 將單集播放資訊轉為 MPV PlayListItem（對應 Electron 的 processSingleMedia）
-fn process_single_media(
-    play_info: &serde_json::Value,
-    proxy_base: &str,
-    cfg: &config::AppConfig,
-    source_index: i64,
-) -> PlayListItem {
+/// play_link 由呼叫方在註冊 proxy session 後統一填充。
+fn process_single_media(play_info: &serde_json::Value) -> PlayListItem {
     let guid = json_str(play_info, "guid");
     let item = play_info.get("item").cloned().unwrap_or_default();
     PlayListItem {
@@ -127,7 +167,7 @@ fn process_single_media(
         episode_number: json_i64(&item, "episode_number") as u32,
         ts: json_f64(play_info, "ts"),
         duration: json_f64(&item, "duration"),
-        play_link: build_proxy_url(proxy_base, cfg, &guid, source_index),
+        play_link: String::new(),
     }
 }
 
@@ -267,7 +307,7 @@ pub async fn play_movie(
         if let Some(episodes) = ep_resp.data {
             if let Some(arr) = episodes.as_array() {
                 for ep in arr {
-                    let item = process_episode_media(ep, &proxy_base, &cfg, 0);
+                    let item = process_episode_media(ep);
                     log::debug!("[play_movie] + 劇集: {}", item.title);
                     playlist.push(item);
                 }
@@ -276,7 +316,7 @@ pub async fn play_movie(
 
         if playlist.is_empty() {
             // 嘗試用 item 本身作為單集
-            playlist.push(process_episode_media(&play_info, &proxy_base, &cfg, 0));
+            playlist.push(process_episode_media(&play_info));
         }
     } else if item_type == "Video" && !parent_guid.is_empty() {
         log::info!("[play_movie] 其他影片模式，取得同級列表...");
@@ -298,7 +338,7 @@ pub async fn play_movie(
         if let Some(items) = item_list_resp.data {
             if let Some(list) = items.get("list").and_then(|l| l.as_array()) {
                 for item in list {
-                    let pi = process_episode_media(item, &proxy_base, &cfg, 0);
+                    let pi = process_episode_media(item);
                     log::debug!("[play_movie] + 影片: {}", pi.title);
                     playlist.push(pi);
                 }
@@ -306,16 +346,30 @@ pub async fn play_movie(
         }
 
         if playlist.is_empty() {
-            playlist.push(process_single_media(&play_info, &proxy_base, &cfg, 0));
+            playlist.push(process_single_media(&play_info));
         }
     } else {
         log::info!("[play_movie] 單集模式");
-        playlist.push(process_single_media(&play_info, &proxy_base, &cfg, 0));
+        playlist.push(process_single_media(&play_info));
     }
 
     if playlist.is_empty() {
         return Err("播放列表為空".to_string());
     }
+
+    // ── Step 2.5: 註冊 proxy session 並填充播放 URL ──────────────
+    // 對應上游：收集全部 itemGuids → POST /api/v1/session → playLink 改為 ?session=
+    let session = {
+        let secret = proxy_daemon.secret().to_string();
+        let item_guids: Vec<String> = playlist.iter().map(|i| i.item_guid.clone()).collect();
+        let session =
+            register_proxy_session(&proxy_base, &secret, token, &cfg, &item_guids).await?;
+        for item in &mut playlist {
+            item.play_link =
+                create_proxy_playback_url(&proxy_base, &session, &item.item_guid, 0);
+        }
+        session
+    };
 
     // ── Step 3: 處理 sourceIndex ──────────────────────────
     // 找到當前播放項目在列表中的位置
@@ -329,10 +383,10 @@ pub async fn play_movie(
             "[play_movie] 使用指定播放源索引: {}",
             payload.source_index
         );
-        // 用指定 sourceIndex 重建當前項目的 proxy URL
-        playlist[current_index].play_link = build_proxy_url(
+        // 用指定 sourceIndex 重建當前項目的 proxy URL（沿用同一個 session）
+        playlist[current_index].play_link = create_proxy_playback_url(
             &proxy_base,
-            &cfg,
+            &session,
             &playlist[current_index].item_guid,
             payload.source_index,
         );

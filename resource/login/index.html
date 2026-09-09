@@ -826,6 +826,10 @@
             <input type="password" id="password" placeholder="请输入密码" spellcheck="false" tabindex="3" />
             <button type="button" class="password-toggle" id="passwordToggle" title="显示/隐藏密码"><img id="passwordToggleImg" width="20px" src="./image/password-show.png" alt="显示密码" /></button>
         </div>
+        <div class="form-group">
+            <label for="accessCode">访问码（可选）</label>
+            <input type="text" id="accessCode" placeholder="服务器启用访问码时填写，否则留空" spellcheck="false" tabindex="4" autocomplete="off" />
+        </div>
         <div class="switch-container">
             <label class="switch">
                 <input type="checkbox" id="httpsSwitch" />
@@ -863,11 +867,14 @@
                 <input type="text" id="proxyUrlInput" placeholder="https://ghfast.top" />
             </div>
             <div class="proxy-switch-row">
-                <span>隐藏原有播放按钮</span>
+                <span>使用 MPV 播放（接管播放按钮）</span>
                 <label class="proxy-switch">
                     <input type="checkbox" id="hideOriginalPlayButtonSwitch" checked>
                     <span class="proxy-slider"></span>
                 </label>
+                <div class="proxy-hint-row" style="font-size:12px;color:#888;margin-top:4px;">
+                    <span>关闭后使用网页原生播放（可在托盘菜单快速切换）</span>
+                </div>
             </div>
             <div class="proxy-panel-footer">
                 <button class="proxy-save-btn" id="proxySaveBtn">保存</button>
@@ -951,6 +958,7 @@
                             domain: data.domain,
                             username: data.username,
                             password: data.password,
+                            access_code: data.accessCode,
                             use_https: data.useHttps
                         });
                         if (result.success) {
@@ -1010,6 +1018,9 @@
             }
             if (config && config.account) {
                 usernameInput.value = config.account;
+            }
+            if (config && config.accessCode) {
+                accessCodeInput.value = config.accessCode;
             }
             renderHistoryList();
             checkInputs();
@@ -1077,6 +1088,7 @@
         const domainInput = document.getElementById('domain');
         const usernameInput = document.getElementById('username');
         const passwordInput = document.getElementById('password');
+        const accessCodeInput = document.getElementById('accessCode');
         const passwordToggle = document.getElementById('passwordToggle');
         const passwordToggleImg = document.getElementById('passwordToggleImg');
         const historyBtn = document.getElementById('historyBtn');
@@ -1288,14 +1300,16 @@
             const domain = domainInput.value.trim();
             const username = usernameInput.value.trim();
             const password = passwordInput.value.trim();
+            const accessCode = accessCodeInput.value.trim();
             const useHttps = document.getElementById('httpsSwitch').checked;
 
-            window.log.info('登录信息:', { domain, username, password, useHttps });
+            window.log.info('登录信息:', { domain, username, useHttps });
 
             const loginData = {
                 domain: domain,
                 username: username,
                 password: password,
+                accessCode: accessCode,
                 useHttps: useHttps
             };
 
@@ -1382,7 +1396,7 @@
             }
 
             const historyHtml = historyData.map((item, index) => `
-                <div class="history-item" data-domain="${item.domain}" data-account="${item.account}" data-password="${item.password}" data-use-https="${item.useHttps || false}" data-index="${index}">
+                <div class="history-item" data-domain="${item.domain}" data-account="${item.account}" data-password="${item.password}" data-access-code="${item.accessCode || ''}" data-use-https="${item.useHttps || false}" data-index="${index}">
                     <div class="history-content">
                         <div class="history-account">${item.account}</div>
                         <div class="history-domain">${item.domain}${item.useHttps ? ' (HTTPS)' : ' (HTTP)'}</div>
@@ -1401,11 +1415,13 @@
                     const domain = item.dataset.domain;
                     const account = item.dataset.account;
                     const password = item.dataset.password;
+                    const accessCode = item.dataset.accessCode || '';
                     const useHttps = item.dataset.useHttps === 'true';
 
                     domainInput.value = domain;
                     usernameInput.value = account;
                     passwordInput.value = password;
+                    accessCodeInput.value = accessCode;
                     document.getElementById('httpsSwitch').checked = useHttps;
 
                     // 关闭下拉框

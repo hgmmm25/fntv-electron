@@ -29,10 +29,15 @@ pub struct AppConfig {
     pub account: Option<String>,
     pub domain: Option<String>,
     pub token: Option<String>,
+    /// AES-256-CBC 加密後的 hex 字串（空字串表示未啟用訪問碼）
+    pub access_code: Option<String>,
     pub use_https: Option<bool>,
     pub history: Option<Vec<HistoryItem>>,
     pub download_proxy_enabled: Option<bool>,
     pub download_proxy: Option<String>,
+    /// 播放偏好（F3，对应上游 playbackPreference）：
+    /// true = 隐藏原始按钮、点击改走 MPV 播放（本地默认，同上游 v2.6.2 默认恢复 MPV）；
+    /// false = 放行网页原生播放按钮。可通过托盘「使用 MPV 播放」勾选项或登录页开关切换。
     pub hide_original_play_button: Option<bool>,
     pub nas_proxy_enabled: Option<bool>,
     pub mpv_player_path: Option<String>,
@@ -49,6 +54,8 @@ pub struct HistoryItem {
     pub account: String,
     /// AES-256-CBC 加密後的 hex 字串
     pub password: String,
+    /// AES-256-CBC 加密後的 hex 字串（空字串表示未啟用訪問碼）
+    pub access_code: String,
     pub use_https: Option<bool>,
 }
 
@@ -60,6 +67,8 @@ pub struct HistoryItemDecrypted {
     pub account: String,
     /// 已解密的明文密碼
     pub password: String,
+    /// 已解密的明文訪問碼（空字串表示未啟用）
+    pub access_code: String,
     pub use_https: Option<bool>,
 }
 
@@ -143,7 +152,13 @@ pub fn write_config(app: &tauri::AppHandle, config: &AppConfig) -> Result<(), St
 /// 取得設定資料（config + 解密後的 history）
 #[tauri::command]
 pub fn get_config(app: tauri::AppHandle) -> Result<ConfigData, String> {
-    let config = read_config(&app);
+    let mut config = read_config(&app);
+    // config.accessCode 儲存為密文，回傳前解密（空/未設定保持空值）
+    config.access_code = config
+        .access_code
+        .as_ref()
+        .map(|enc| decrypt_password(enc))
+        .filter(|plain| !plain.is_empty());
     let history = config
         .history
         .as_ref()
@@ -153,6 +168,7 @@ pub fn get_config(app: tauri::AppHandle) -> Result<ConfigData, String> {
                     domain: item.domain.clone(),
                     account: item.account.clone(),
                     password: decrypt_password(&item.password),
+                    access_code: decrypt_password(&item.access_code),
                     use_https: item.use_https,
                 })
                 .collect()
@@ -162,19 +178,28 @@ pub fn get_config(app: tauri::AppHandle) -> Result<ConfigData, String> {
     Ok(ConfigData { config, history })
 }
 
-/// 儲存登入設定（account, domain, token, useHttps）
+/// 儲存登入設定（account, domain, token, accessCode, useHttps）
 #[tauri::command]
 pub fn save_login_config(
     app: tauri::AppHandle,
     account: String,
     domain: String,
     token: String,
+    access_code: Option<String>,
     use_https: Option<bool>,
 ) -> Result<(), String> {
     let mut config = read_config(&app);
     config.account = Some(account);
     config.domain = Some(domain);
     config.token = Some(token);
+    // 訪問碼非空才覆寫；空值保持舊值（對應上游 saveConfig 的 undefined 語義）
+    if let Some(code) = access_code {
+        config.access_code = if code.is_empty() {
+            Some(String::new())
+        } else {
+            Some(encrypt_password(&code))
+        };
+    }
     config.use_https = Some(use_https.unwrap_or(false));
     write_config(&app, &config)
 }
@@ -191,6 +216,7 @@ pub fn get_history(app: tauri::AppHandle) -> Result<Vec<HistoryItemDecrypted>, S
             domain: item.domain,
             account: item.account,
             password: decrypt_password(&item.password),
+            access_code: decrypt_password(&item.access_code),
             use_https: item.use_https,
         })
         .collect())
@@ -203,6 +229,7 @@ pub fn add_history(
     domain: String,
     account: String,
     password: String,
+    access_code: Option<String>,
     use_https: Option<bool>,
 ) -> Result<(), String> {
     let mut config = read_config(&app);
@@ -218,6 +245,15 @@ pub fn add_history(
             domain,
             account,
             password: encrypt_password(&password),
+            access_code: access_code
+                .map(|code| {
+                    if code.is_empty() {
+                        String::new()
+                    } else {
+                        encrypt_password(&code)
+                    }
+                })
+                .unwrap_or_default(),
             use_https: Some(use_https.unwrap_or(false)),
         },
     );
@@ -282,14 +318,20 @@ pub fn set_download_proxy_config(
     write_config(&app, &config)
 }
 
-/// 取得「隱藏原有播放按鈕」設定
+/// 取得播放偏好：是否隐藏原始播放按钮并改走 MPV（F3）
+///
+/// 默认 true（MPV 播放优先，对应上游 v2.6.2 “恢复 MPV 为默认播放方式”）。
 #[tauri::command]
 pub fn get_hide_original_play_button(app: tauri::AppHandle) -> Result<bool, String> {
     let config = read_config(&app);
     Ok(config.hide_original_play_button.unwrap_or(true))
 }
 
-/// 設定「隱藏原有播放按鈕」
+/// 設定播放偏好：true = MPV 接管（隐藏原始按钮），false = 网页原生播放
+///
+/// 上游等价实现为 src/modules/fn_config/playbackPreference.ts +
+/// src/main/tray.ts 的 setHideOriginalPlayButton 切换；本地另经
+/// inject/playButton.ts、inject/playMaskButton.ts 读取生效。
 #[tauri::command]
 pub fn set_hide_original_play_button(
     app: tauri::AppHandle,

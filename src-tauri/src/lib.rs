@@ -18,6 +18,7 @@
 //! - `RunEvent::ExitRequested` — 用戶點 X / tray 退出 / app.exit() 時觸發
 //! - `RunEvent::Exit` — 進程真正退出前的最後一道保障
 
+mod access_code;
 mod auth;
 mod bridge;
 mod config;
