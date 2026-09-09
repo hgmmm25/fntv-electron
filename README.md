@@ -29,12 +29,11 @@ Git(https://git-scm.com/install/windows)
 - [fnToPotplayer](https://github.com/gudqs7/fnToPotplayer) - 飞牛影视调用Potplayer
 - [fnos-tv](https://github.com/thshu/fnos-tv) - fnos-tv 支持弹幕的飞牛影视
 - [mpv弹幕插件](https://github.com/Tony15246/uosc_danmaku) - uosc_danmaku 基于uosc的弹幕插件
+- [以及源项目]
 
 ## 📄 许可证
 
 本项目采用 [GPL3.0 许可证](LICENSE)
-
-Copyright (c) 2025 Tag mig hånden
 
 ---
 
